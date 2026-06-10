@@ -113,6 +113,10 @@ async function startDecoding() {
     renderRecBtn();
     await call('Stop');
   }
+  if (fileBtn.getAttribute('aria-pressed') === 'true') {
+    $('textOut').textContent = '';
+    $('morseOut').textContent = '';
+  }
   state.running = true;
   renderRecBtn();
   call('Start');
@@ -228,6 +232,10 @@ fileBtn.addEventListener('click', async (e) => {
 $('recBtn').addEventListener('click', () => {
   state.running = !state.running;
   renderRecBtn();
+  if (state.running && fileBtn.getAttribute('aria-pressed') === 'true') {
+    $('textOut').textContent = '';
+    $('morseOut').textContent = '';
+  }
   call(state.running ? 'Start' : 'Stop');
 });
 

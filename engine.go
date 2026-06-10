@@ -80,6 +80,8 @@ type Engine struct {
 	// Tracks how much of dec.Flush()'s output has already been emitted so the
 	// frontend (which appends chunks) never receives duplicate text.
 	lastEmitLen int
+	morseSyms   strings.Builder
+	lastMorseLen int
 }
 
 func NewEngine(emit emitFunc) *Engine {
@@ -217,8 +219,29 @@ func (e *Engine) initLiveDecoder(filter FilterConfig, speed SpeedConfig) {
 	e.liveIsTone = false
 	e.liveMS = 0
 	e.lastEmitLen = 0
+	e.morseSyms.Reset()
+	e.lastMorseLen = 0
 	e.toneDurMs = nil
 	e.silDurMs = nil
+}
+
+// emitDecoded flushes any new text and morse content to the frontend.
+// Safe to call speculatively — emits nothing when there is no new content.
+func (e *Engine) emitDecoded() {
+	full := e.dec.Flush()
+	morseFull := e.morseSyms.String()
+	text, morseChunk := "", ""
+	if len(full) > e.lastEmitLen {
+		text = full[e.lastEmitLen:]
+		e.lastEmitLen = len(full)
+	}
+	if len(morseFull) > e.lastMorseLen {
+		morseChunk = morseFull[e.lastMorseLen:]
+		e.lastMorseLen = len(morseFull)
+	}
+	if text != "" || morseChunk != "" {
+		e.emit("decoded", DecodedChunk{Text: text, Morse: morseChunk})
+	}
 }
 
 func (e *Engine) Start() {
@@ -312,9 +335,7 @@ func (e *Engine) capture(stream *portaudio.Stream, in []float32) {
 		e.mu.Unlock()
 		// Flush any partial word that never got a trailing word-gap.
 		if e.dec != nil {
-			if full := e.dec.Flush(); len(full) > e.lastEmitLen {
-				e.emit("decoded", DecodedChunk{Text: full[e.lastEmitLen:]})
-			}
+			e.emitDecoded()
 		}
 	}()
 
@@ -460,10 +481,7 @@ func (e *Engine) process(in []float32) {
 	if !e.liveIsTone && e.liveMS > 0 && e.est != nil && e.est.IsBootstrapped() {
 		if sym := e.est.Classify(false, e.liveMS); sym.Type == morse.SymCharGap {
 			e.dec.Feed(sym)
-			if full := e.dec.Flush(); len(full) > e.lastEmitLen {
-				e.emit("decoded", DecodedChunk{Text: full[e.lastEmitLen:]})
-				e.lastEmitLen = len(full)
-			}
+			e.emitDecoded()
 		}
 	}
 }
@@ -522,16 +540,14 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 	sym := e.est.Classify(isTone, ms)
 	clampDotMs(e.est) // keep WPM ≤ maxAutoWPM after any adaptive update
 
+	e.morseSyms.WriteString(sym.Type.String())
 	e.dec.Feed(sym)
 
 	// Emit on every character or word boundary. The peek in process() may have
-	// already fed this char gap and updated lastEmitLen, in which case Flush()
-	// returns the same text and nothing is emitted (idempotent).
+	// already fed this char gap and updated lastEmitLen, in which case emitDecoded
+	// finds no new text but may still flush a pending morse separator.
 	if sym.Type == morse.SymCharGap || sym.Type == morse.SymWordGap {
-		if full := e.dec.Flush(); len(full) > e.lastEmitLen {
-			e.emit("decoded", DecodedChunk{Text: full[e.lastEmitLen:]})
-			e.lastEmitLen = len(full)
-		}
+		e.emitDecoded()
 	}
 }
 
