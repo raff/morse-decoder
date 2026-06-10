@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Morse straight key app icon">
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="#161b22"/>
+  <g transform="translate(47,-41) scale(9.3)" fill="#d9dde3">
+    <rect x="14" y="82" width="72" height="9" rx="4.5"/>
+    <rect x="20" y="75" width="58" height="7" rx="3.5"/>
+    <rect x="60" y="56" width="9" height="20" rx="3"/>
+    <rect x="23" y="68" width="7" height="8" rx="2"/>
+    <circle cx="26.5" cy="68" r="2" fill="#34d0b4"/>
+    <g transform="rotate(-11 64.5 55)">
+      <rect x="20" y="52" width="46" height="5.5" rx="2.75"/>
+      <ellipse cx="24" cy="51.5" rx="9" ry="2.6" fill="#34d0b4"/>
+      <circle cx="24" cy="43.5" r="8" fill="#34d0b4"/>
+    </g>
+    <circle cx="64.5" cy="55" r="6" fill="#34d0b4"/>
+    <circle cx="64.5" cy="55" r="2.4" fill="#161b22"/>
+  </g>
+</svg>
