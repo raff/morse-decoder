@@ -45,7 +45,10 @@ The required `NSMicrophoneUsageDescription` key is already in
 | **WAV file** | Click the folder icon → pick a file. Decoding starts automatically and the button resets when done. |
 
 Previously selected mic devices are remembered across launches (stored in
-`localStorage`). File paths are not restored — they go stale.
+`localStorage`). If the saved device is no longer present when decoding starts
+(e.g. a USB radio interface that is powered off), an error is shown and no
+audio is opened — the system default microphone is not used as a silent
+fallback. File paths are not restored — they go stale.
 
 ## Controls
 

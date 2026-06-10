@@ -43,14 +43,15 @@ type Status struct {
 type Engine struct {
 	emit emitFunc
 
-	mu       sync.Mutex
-	running  bool
-	stream   *portaudio.Stream
-	wg       sync.WaitGroup
-	devices  []*portaudio.DeviceInfo
-	selected *portaudio.DeviceInfo
-	srcKind  string // "mic" or "file"
-	filePath string
+	mu           sync.Mutex
+	running      bool
+	stream       *portaudio.Stream
+	wg           sync.WaitGroup
+	devices      []*portaudio.DeviceInfo
+	selected     *portaudio.DeviceInfo
+	selectedName string // the name requested via SetSource; "" means use default
+	srcKind      string // "mic" or "file"
+	filePath     string
 
 	filter     FilterConfig
 	speed      SpeedConfig
@@ -115,6 +116,16 @@ func (e *Engine) ListInputDevices() []string {
 			names = append(names, d.Name)
 		}
 	}
+	// Re-resolve a pending device name now that the device list is fresh.
+	if e.selectedName != "" {
+		e.selected = nil
+		for _, d := range e.devices {
+			if d.Name == e.selectedName {
+				e.selected = d
+				break
+			}
+		}
+	}
 	return names
 }
 
@@ -126,6 +137,8 @@ func (e *Engine) SetSource(kind, device string) {
 		e.filePath = device
 		return
 	}
+	e.selectedName = device
+	e.selected = nil
 	for _, d := range e.devices {
 		if d.Name == device {
 			e.selected = d
@@ -227,12 +240,17 @@ func (e *Engine) Start() {
 	}
 
 	dev := e.selected
+	name := e.selectedName
 	filter := e.filter
 	speed := e.speed
 	e.initLiveDecoder(filter, speed)
 	e.mu.Unlock()
 
 	if dev == nil {
+		if name != "" {
+			e.emit("error", "device not available: "+name)
+			return
+		}
 		d, err := portaudio.DefaultInputDevice()
 		if err != nil {
 			e.emit("error", err.Error())
