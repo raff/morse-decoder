@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Morse Decoder</title>
+</head>
+<body>
+  <div id="md">
+
+    <div class="toolbar" id="toolbar">
+      <div class="grp">
+        <button class="ic" id="micBtn" aria-pressed="false" aria-haspopup="true" aria-expanded="false" aria-label="Select audio input"></button>
+        <button class="ic" id="fileBtn" aria-pressed="false" aria-label="Open WAV file"></button>
+        <button class="ic" id="recBtn" aria-pressed="false" aria-label="Start decoding"></button>
+      </div>
+      <span class="grp" style="gap:6px;"><span id="dot" style="width:7px;height:7px;border-radius:50%;background:var(--tx3);"></span><span class="lab" id="statusText">Idle</span></span>
+
+      <div class="sep"></div>
+      <div class="grp"><span class="lab">Freq</span><span class="ro" id="freqRo">700</span><span class="lab" style="color:var(--tx3)">Hz</span></div>
+
+      <button class="tbtn" id="filtBtn" aria-haspopup="true" aria-expanded="false">
+        <span class="sub" id="filtSummary">Bandpass · 200 Hz · sq 3</span>
+        <span id="filtChevron"></span>
+      </button>
+
+      <div class="sep"></div>
+      <div class="grp">
+        <span class="lab">WPM</span>
+        <span class="step" id="wpmStep" data-key="wpm"><button class="dec" aria-label="Decrease WPM">−</button><span class="sv" id="wpmVal">20</span><button class="inc" aria-label="Increase WPM">+</button></span>
+        <button id="autoWpm" class="pill" aria-pressed="false">Auto</button>
+      </div>
+
+      <button class="ic" id="themeBtn" aria-label="Toggle light or dark mode" style="width:30px;height:30px;margin-left:auto;"></button>
+
+      <div class="pop" id="popFilters">
+        <p class="head">Filters</p>
+        <div class="frow"><span class="lab">Type</span>
+          <select id="ftype"><option>None</option><option selected>Bandpass</option><option>Narrow CW</option><option>Auto-notch</option></select></div>
+        <div class="frow"><span class="lab">Center</span><span class="step" data-key="fcenter"><button class="dec" aria-label="Decrease center">−</button><span class="sv">700</span><button class="inc" aria-label="Increase center">+</button></span></div>
+        <div class="frow"><span class="lab">Bandwidth</span><span class="step" data-key="fbw"><button class="dec" aria-label="Decrease bandwidth">−</button><span class="sv">200</span><button class="inc" aria-label="Increase bandwidth">+</button></span></div>
+        <div class="frow"><span class="lab">Squelch</span><span class="step" data-key="sq"><button class="dec" aria-label="Decrease squelch">−</button><span class="sv">3</span><button class="inc" aria-label="Increase squelch">+</button></span></div>
+        <div style="display:flex; gap:8px; margin:2px 0 12px;"><button id="nr" class="pill" aria-pressed="true">Noise reduction</button><button id="agc" class="pill" aria-pressed="false">AGC</button></div>
+        <button class="sbtn" id="filtDone" style="width:100%; justify-content:center; background:var(--acc); color:var(--bg); border-color:var(--acc);">Done</button>
+      </div>
+
+      <div class="pop" id="popDevices">
+        <p class="head">Audio input</p>
+        <div id="devList"></div>
+      </div>
+    </div>
+
+    <div class="spec-row">
+      <span id="waveIcon"></span>
+      <canvas id="spec" width="600" height="34"></canvas>
+    </div>
+
+    <div class="decode">
+      <div class="bar">
+        <span class="lab">DECODED</span>
+        <div class="seg" id="viewSeg" role="group" aria-label="Output view">
+          <button data-view="both" aria-pressed="true">Both</button>
+          <button data-view="text" aria-pressed="false">Text</button>
+          <button data-view="morse" aria-pressed="false">Morse</button>
+        </div>
+      </div>
+      <div class="pane">
+        <div id="textOut"></div>
+        <div id="morseOut"></div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <div class="grp" style="gap:10px;">
+        <button class="sbtn" id="clearBtn">Clear</button>
+        <button class="sbtn" id="srcBtn"><span id="srcLabel">No source</span></button>
+      </div>
+      <div class="grp" style="gap:14px;">
+        <span class="meter" id="meter">−42 dB</span>
+        <button class="ic" id="exportBtn" style="width:30px;height:30px;" aria-label="Export decoded text"></button>
+      </div>
+    </div>
+
+  </div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
