@@ -310,6 +310,11 @@ if (haveBackend) {
     renderRecBtn();
     $('dot').style.background = 'var(--rec)';
     $('statusText').textContent = String(msg).slice(0, 80);
+    // If the device itself was unavailable, deactivate the source button so it
+    // doesn't stay green while pointing at a device that couldn't be opened.
+    if (String(msg).startsWith('device not available:')) {
+      micBtn.setAttribute('aria-pressed', 'false');
+    }
   });
 }
 
@@ -320,10 +325,12 @@ drawSpectrum();
 pushFilter();
 pushSpeed();
 
-// Restore last mic device selection (if any) — show it in the UI but don't
-// start decoding. File paths are intentionally not restored (they go stale).
+// Restore last mic device selection (if any) — show the name in the label but
+// leave both source buttons unselected until the device is confirmed available.
+// File paths are intentionally not restored (they go stale).
 const savedMic = localStorage.getItem('lastMicDevice');
 if (savedMic && haveBackend) {
-  setSourceUI(true, savedMic);
+  state.device = savedMic;
+  $('srcLabel').textContent = savedMic;
   call('SetSource', 'mic', savedMic);
 }
