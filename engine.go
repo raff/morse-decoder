@@ -496,12 +496,12 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 	// ── Noise gate ───────────────────────────────────────────────────────────
 	// Drop tone pulses that are implausibly short before they touch the speed
 	// estimator. The threshold is the larger of an absolute 10 ms floor and
-	// 30 % of the current dot estimate — so it scales with the detected speed
+	// 40 % of the current dot estimate — so it scales with the detected speed
 	// and stays effective whether the operator is running at 5 or 50 WPM.
 	if isTone {
 		threshold := 10.0
 		if e.est.IsBootstrapped() {
-			if rel := e.est.DotMs * 0.30; rel > threshold {
+			if rel := e.est.DotMs * 0.40; rel > threshold {
 				threshold = rel
 			}
 		}

@@ -132,7 +132,7 @@ func (e *SpeedEstimator) Bootstrap(toneDurationsMs []float64) {
 func (e *SpeedEstimator) update(toneMs float64) {
 	residual := math.Abs(toneMs-e.DotMs) / e.DotMs
 	if residual > 0.30 {
-		e.alpha = 0.25 // temporary boost: sender changed speed
+		e.alpha = 0.15 // temporary boost: sender changed speed
 	} else {
 		e.alpha = e.baseAlpha
 	}
@@ -186,8 +186,10 @@ func (e *SpeedEstimator) classifyTone(ms float64) Symbol {
 	var t SymbolType
 	if ms < 2.0*d {
 		t = SymDot
-		// confident dot: use for adaptive update
-		if e.adaptive && ms < 1.8*d {
+		// confident dot: use for adaptive update — require lower bound so
+		// noise bursts (short relative to the current estimate) don't pull
+		// DotMs down and trigger the noise-amplification feedback loop.
+		if e.adaptive && ms >= 0.5*d && ms < 1.8*d {
 			e.update(ms)
 		}
 	} else {

@@ -41,7 +41,7 @@ $('waveIcon').innerHTML = icons.wave;
 const md = $('md');
 const state = {
   sq: 3, wpm: 20, auto: false, running: false,
-  ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true, agc: false,
+  ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true,
   theme: 'light', device: null, detected: 0,
 };
 const cfg = {
@@ -54,7 +54,7 @@ const cfg = {
 function pushFilter() {
   call('SetFilter', {
     type: state.ftype, center: state.fcenter, bandwidth: state.fbw,
-    squelch: state.sq, noiseRed: state.nr, agc: state.agc,
+    squelch: state.sq, noiseRed: state.nr,
   });
 }
 function pushSpeed() { call('SetSpeed', { wpm: state.wpm, auto: state.auto }); }
@@ -150,7 +150,6 @@ function toggle(id, key) {
   });
 }
 toggle('nr', 'nr');
-toggle('agc', 'agc');
 
 // --- Popovers (filters + device picker share this) ---------------------------
 const toolbar = $('toolbar'), pop = $('popFilters'), filtBtn = $('filtBtn');
@@ -287,6 +286,29 @@ function drawSpectrum() {
     ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke(); ctx.setLineDash([]);
   }
 }
+
+// --- Spectrum drag to reposition center frequency ----------------------------
+let specDragging = false;
+
+function freqFromPointer(clientX) {
+  const rect = cv.getBoundingClientRect();
+  const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+  const raw = (x / rect.width) * (SPEC_FMAX - SPEC_FMIN) + SPEC_FMIN;
+  const c = cfg.fcenter;
+  return Math.max(c.min, Math.min(c.max, Math.round(raw / c.step) * c.step));
+}
+
+function applySpecCenter(clientX) {
+  state.fcenter = freqFromPointer(clientX);
+  document.querySelector('.step[data-key="fcenter"] .sv').textContent = state.fcenter;
+  summary();
+  drawSpectrum();
+  pushFilter();
+}
+
+cv.addEventListener('mousedown', (e) => { specDragging = true; applySpecCenter(e.clientX); });
+document.addEventListener('mousemove', (e) => { if (specDragging) applySpecCenter(e.clientX); });
+document.addEventListener('mouseup', () => { specDragging = false; });
 
 // --- Events from the backend -------------------------------------------------
 if (haveBackend) {

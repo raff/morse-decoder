@@ -9,12 +9,11 @@ import (
 
 // FilterConfig mirrors the "Filters" dialog in the UI.
 type FilterConfig struct {
-	Type      string `json:"type"`      // "None" | "Bandpass" | "Narrow CW" | "Auto-notch"
+	Type      string `json:"type"`      // "None" | "Bandpass" | "Narrow CW"
 	Center    int    `json:"center"`    // Hz
 	Bandwidth int    `json:"bandwidth"` // Hz
 	Squelch   int    `json:"squelch"`   // 0-9
 	NoiseRed  bool   `json:"noiseRed"`
-	AGC       bool   `json:"agc"`
 }
 
 // SpeedConfig mirrors the WPM control (with auto-detect).
