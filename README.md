@@ -43,12 +43,28 @@ The required `NSMicrophoneUsageDescription` key is already in
 |--------|-----------------|
 | **Microphone / radio interface** | Click the mic icon → pick a device. Decoding starts automatically. |
 | **WAV file** | Click the folder icon → pick a file. Decoding starts automatically and the button resets when done. |
+| **WebSDR / online SDR** | Click the globe icon → enter the server URL → click Open. The app opens the site in your browser via a local proxy, then press Play to start decoding. |
 
 Previously selected mic devices are remembered across launches (stored in
 `localStorage`). If the saved device is no longer present when decoding starts
 (e.g. a USB radio interface that is powered off), an error is shown and no
 audio is opened — the system default microphone is not used as a silent
-fallback. File paths are not restored — they go stale.
+fallback. File paths are not restored — they go stale. The last WebSDR URL is
+remembered across launches.
+
+### WebSDR source — how it works
+
+Clicking Open starts a local HTTP reverse-proxy on a random port. Your browser
+loads the SDR site through this proxy, which injects a small JavaScript snippet
+before the page runs. The snippet intercepts the Web Audio API (`AudioContext`)
+and streams the decoded PCM audio back to the app over a local WebSocket
+(`ws://localhost:PORT/audio`). The SDR's own WebSocket and HTTP traffic is
+forwarded transparently, so tuning, mode switching, and all SDR controls work
+normally. No audio is rerouted at the OS level.
+
+Compatible with any server built on the **WebSDR** (PA3FWM) software. Other
+platforms (OpenWebRX, KiwiSDR) also use Web Audio API and should work, but
+have not been tested.
 
 ## Controls
 
@@ -81,6 +97,7 @@ signal required).
 main.go                  Wails setup (window, embed, bindings)
 app.go                   API methods bound to the frontend
 engine.go                DSP engine — capture, filtering, decoding
+websdr/proxy.go          Local HTTP reverse-proxy + WebSocket audio tap
 audio/wav.go             WAV parser (PCM 8/16/24/32-bit, mono/stereo)
 dsp/filter.go            Biquad IIR filters (bandpass, lowpass, chains)
 dsp/envelope.go          Envelope detection + Schmitt trigger
@@ -101,9 +118,10 @@ frontend/src/style.css   Theme (light/dark) and component styles
 | Call | Purpose |
 |------|---------|
 | `Start()` / `Stop()` | Begin / end decoding |
-| `SetSource(kind, device)` | `"mic"` + device name, or `"file"` + path |
+| `SetSource(kind, device)` | `"mic"` + device name, `"file"` + path, or `"websdr"` |
 | `ListInputDevices()` | Device names for the source picker |
 | `OpenWavFile()` | Native file picker, returns chosen path |
+| `OpenWebSDR(url)` | Start proxy for url, open in browser, switch to websdr source |
 | `SetFilter(FilterConfig)` | Type, centre Hz, bandwidth Hz, squelch, NR, AGC |
 | `SetSpeed(SpeedConfig)` | WPM hint + auto-detect flag |
 | `Clear()` / `ExportText(text)` | Reset decoder state / save text |
@@ -135,6 +153,13 @@ LoadWAV → carrier FFT → bandpass chain → envelope (rectify + lowpass 100 H
 portaudio read → bandpass chain → envelope (rectify + lowpass 100 Hz)
 → running-peak AGC (τ ≈ 2 s) → Schmitt trigger → pulse merger
 → noise gate (< max(10 ms, 0.3 × dotMs) dropped) → classify → ASCII
+```
+
+### WebSDR mode (streaming, variable sample rate from browser)
+```
+browser AudioContext tap (ScriptProcessorNode 4096 frames)
+→ mono mix → WebSocket → local proxy → engine AudioCh
+→ [same pipeline as live mic, DSP reinitialised to actual sample rate on first chunk]
 ```
 
 Speed is seeded from the manual WPM setting. In Auto mode the EMA adapts

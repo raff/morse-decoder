@@ -9,12 +9,12 @@ import (
 	"morse-decoder/audio"
 	"morse-decoder/dsp"
 	"morse-decoder/morse"
+	"morse-decoder/websdr"
 )
 
-// Capture settings. Match SampleRate/band to whatever your radio interface and
-// decoder expect. specFmin/specFmax must match the constants in main.js.
+// Capture settings. specFmin/specFmax must match the constants in main.js.
 const (
-	sampleRate      = 48000
+	sampleRate      = 48000 // PortAudio / WAV default; WebSDR uses liveSampleRate
 	framesPerBuffer = 2048
 	specFmin        = 300.0
 	specFmax        = 1100.0
@@ -68,6 +68,11 @@ type Engine struct {
 	est     *morse.SpeedEstimator
 	dec     *morse.Decoder
 	agcPeak float64
+
+	// WebSDR source state.
+	webSDRProxy  *websdr.Proxy  // non-nil while websdr source is active
+	liveSR       int            // actual sample rate for the live pipeline
+	captureDone  chan struct{}   // closed by Stop() to unblock captureWebSDR
 
 	// Pulse merger: combines partial pulses split at buffer boundaries.
 	liveIsTone bool
@@ -135,18 +140,28 @@ func (e *Engine) SetSource(kind, device string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.srcKind = kind
-	if kind == "file" {
+	switch kind {
+	case "file":
 		e.filePath = device
-		return
-	}
-	e.selectedName = device
-	e.selected = nil
-	for _, d := range e.devices {
-		if d.Name == device {
-			e.selected = d
-			return
+	case "websdr":
+		// device is unused; the proxy is attached separately via SetWebSDRProxy.
+	default: // "mic"
+		e.selectedName = device
+		e.selected = nil
+		for _, d := range e.devices {
+			if d.Name == device {
+				e.selected = d
+				return
+			}
 		}
 	}
+}
+
+// SetWebSDRProxy attaches a running proxy so Start() can read from it.
+func (e *Engine) SetWebSDRProxy(p *websdr.Proxy) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.webSDRProxy = p
 }
 
 func (e *Engine) SetFilter(cfg FilterConfig) {
@@ -157,7 +172,7 @@ func (e *Engine) SetFilter(cfg FilterConfig) {
 	// goroutine picks up the new pointer on its next buffer (pointer write is
 	// atomic on 64-bit; the old chain is simply abandoned).
 	if e.lp != nil {
-		chain := filterChain(cfg, sampleRate)
+		chain := filterChain(cfg, e.liveSR)
 		e.bp = &chain
 		e.schmitt.High, e.schmitt.Low = schmittThresholds(cfg.Squelch)
 	}
@@ -206,10 +221,11 @@ func (e *Engine) Clear() {
 // initLiveDecoder (re-)initialises the incremental DSP pipeline.
 // Called before the capture goroutine starts (lock held) or from within
 // process() after reading wantClear (no lock needed there).
-func (e *Engine) initLiveDecoder(filter FilterConfig, speed SpeedConfig) {
-	chain := filterChain(filter, sampleRate)
+func (e *Engine) initLiveDecoder(filter FilterConfig, speed SpeedConfig, sr int) {
+	e.liveSR = sr
+	chain := filterChain(filter, sr)
 	e.bp = &chain
-	e.lp = dsp.NewLowpass(100.0, sampleRate)
+	e.lp = dsp.NewLowpass(100.0, sr)
 	e.schmitt = dsp.NewSchmittTrigger()
 	e.schmitt.High, e.schmitt.Low = schmittThresholds(filter.Squelch)
 	wpmHint := float64(speed.WPM)
@@ -262,11 +278,30 @@ func (e *Engine) Start() {
 		return
 	}
 
+	if e.srcKind == "websdr" {
+		proxy := e.webSDRProxy
+		if proxy == nil {
+			e.mu.Unlock()
+			e.emit("error", "no WebSDR proxy attached")
+			return
+		}
+		filter := e.filter
+		speed := e.speed
+		e.initLiveDecoder(filter, speed, sampleRate) // real rate updated on first chunk
+		done := make(chan struct{})
+		e.captureDone = done
+		e.running = true
+		e.mu.Unlock()
+		e.wg.Add(1)
+		go e.captureWebSDR(proxy, done)
+		return
+	}
+
 	dev := e.selected
 	name := e.selectedName
 	filter := e.filter
 	speed := e.speed
-	e.initLiveDecoder(filter, speed)
+	e.initLiveDecoder(filter, speed, sampleRate)
 	e.mu.Unlock()
 
 	if dev == nil {
@@ -320,6 +355,11 @@ func (e *Engine) Stop() {
 		return
 	}
 	e.running = false
+	// Unblock captureWebSDR if it is waiting on the audio channel.
+	if e.captureDone != nil {
+		close(e.captureDone)
+		e.captureDone = nil
+	}
 	e.mu.Unlock()
 	e.wg.Wait()
 }
@@ -357,6 +397,48 @@ func (e *Engine) capture(stream *portaudio.Stream, in []float32) {
 	}
 }
 
+// captureWebSDR reads audio chunks from the proxy and feeds them to process().
+// The sample rate is taken from the first chunk's header and may differ from
+// the PortAudio default (WebSDR typically operates at 8000–11025 Hz).
+func (e *Engine) captureWebSDR(proxy *websdr.Proxy, stopCh <-chan struct{}) {
+	defer e.wg.Done()
+	defer func() {
+		if e.dec != nil {
+			e.emitDecoded()
+		}
+	}()
+
+	for {
+		e.mu.Lock()
+		running := e.running
+		e.mu.Unlock()
+		if !running {
+			return
+		}
+
+		var chunk websdr.AudioChunk
+		select {
+		case chunk = <-proxy.AudioCh:
+		case <-proxy.Done():
+			return
+		case <-stopCh:
+			return
+		}
+
+		// Reinitialise the pipeline if this is the first chunk or rate changed.
+		// Hold the lock for the full reinit so SetFilter can't race on e.bp/e.lp.
+		if chunk.Rate != e.liveSR {
+			e.mu.Lock()
+			filter := e.filter
+			speed := e.speed
+			e.initLiveDecoder(filter, speed, chunk.Rate)
+			e.mu.Unlock()
+		}
+
+		e.process(chunk.Samples)
+	}
+}
+
 // process turns one buffer of samples into UI updates.
 func (e *Engine) process(in []float32) {
 	// Handle deferred Clear() requests.
@@ -364,10 +446,11 @@ func (e *Engine) process(in []float32) {
 	if e.wantClear {
 		filter := e.filter
 		speed := e.speed
+		sr := e.liveSR
 		e.wantClear = false
 		e.speedDirty = false
 		e.mu.Unlock()
-		e.initLiveDecoder(filter, speed)
+		e.initLiveDecoder(filter, speed, sr)
 	} else if e.speedDirty {
 		speed := e.speed
 		e.speedDirty = false
@@ -400,7 +483,7 @@ func (e *Engine) process(in []float32) {
 	var maxMag, peakFreq float64
 	for i := 0; i < bins; i++ {
 		f := specFmin + (float64(i)+0.5)/bins*(specFmax-specFmin)
-		m := goertzelMag(in, f, sampleRate)
+		m := goertzelMag(in, f, float64(e.liveSR))
 		mags[i] = m
 		if m > maxMag {
 			maxMag, peakFreq = m, f
@@ -459,7 +542,7 @@ func (e *Engine) process(in []float32) {
 
 	// Merge pulse events across buffer boundaries and decode completed pulses.
 	for _, evt := range events {
-		ms := float64(evt.DurationSamples) / float64(sampleRate) * 1000.0
+		ms := float64(evt.DurationSamples) / float64(e.liveSR) * 1000.0
 		if e.liveMS > 0 && evt.IsTone == e.liveIsTone {
 			// Same polarity as the pending pulse — it was split at the buffer edge.
 			e.liveMS += ms

@@ -12,6 +12,7 @@
       <div class="grp">
         <button class="ic" id="micBtn" aria-pressed="false" aria-haspopup="true" aria-expanded="false" aria-label="Select audio input"></button>
         <button class="ic" id="fileBtn" aria-pressed="false" aria-label="Open WAV file"></button>
+        <button class="ic" id="webBtn" aria-pressed="false" aria-haspopup="true" aria-expanded="false" aria-label="Open WebSDR"></button>
         <button class="ic" id="recBtn" aria-pressed="false" aria-label="Start decoding"></button>
       </div>
       <span class="grp" style="gap:6px;"><span id="dot" style="width:7px;height:7px;border-radius:50%;background:var(--tx3);"></span><span class="lab" id="statusText">Idle</span></span>
@@ -44,6 +45,18 @@
       <div class="pop" id="popDevices">
         <p class="head">Audio input</p>
         <div id="devList"></div>
+      </div>
+
+      <div class="pop" id="popWebSDR">
+        <p class="head">WebSDR</p>
+        <div class="frow" style="flex-direction:column; align-items:stretch; gap:8px;">
+          <label class="lab" for="webSDRUrl">Server URL</label>
+          <input id="webSDRUrl" type="url" placeholder="http://websdr.fi:8080/" spellcheck="false" autocomplete="off" />
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="sbtn" id="webSDRCancel" style="flex:1; justify-content:center;">Cancel</button>
+          <button class="sbtn" id="webSDROpen" style="flex:1; justify-content:center; background:var(--acc); color:var(--bg); border-color:var(--acc);">Open</button>
+        </div>
       </div>
     </div>
 

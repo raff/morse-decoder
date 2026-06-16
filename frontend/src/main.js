@@ -21,6 +21,7 @@ const SVG = (paths, extra = '') =>
 const icons = {
   mic: SVG('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="21"/>'),
   folder: SVG('<path d="M3 7a2 2 0 0 1 2-2h3.5l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
+  web: SVG('<circle cx="12" cy="12" r="9"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>'),
   export: SVG('<path d="M14 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8"/><path d="M11 12h10"/><path d="M18 9l3 3-3 3"/>'),
   chevron: SVG('<path d="M6 9l6 6 6-6"/>'),
   wave: SVG('<path d="M3 12h2l2-6 4 12 3-9 2 3h5"/>'),
@@ -32,6 +33,7 @@ const icons = {
 const $ = (id) => document.getElementById(id);
 $('micBtn').innerHTML = icons.mic;
 $('fileBtn').innerHTML = icons.folder;
+$('webBtn').innerHTML = icons.web;
 $('exportBtn').innerHTML = icons.export;
 $('filtChevron').innerHTML = icons.chevron;
 $('waveIcon').innerHTML = icons.wave;
@@ -177,9 +179,11 @@ document.addEventListener('click', (e) => {
 
 // --- Source ------------------------------------------------------------------
 const micBtn = $('micBtn'), fileBtn = $('fileBtn'), popDevices = $('popDevices'), devList = $('devList');
+const webBtn = $('webBtn'), popWebSDR = $('popWebSDR'), webSDRUrlInput = $('webSDRUrl');
 function setSourceUI(mic, label) {
   micBtn.setAttribute('aria-pressed', mic ? 'true' : 'false');
   fileBtn.setAttribute('aria-pressed', mic ? 'false' : 'true');
+  webBtn.setAttribute('aria-pressed', 'false');
   $('srcLabel').textContent = label;
 }
 function renderDevList(devices) {
@@ -226,6 +230,50 @@ fileBtn.addEventListener('click', async (e) => {
   await call('SetSource', 'file', path);
   startDecoding();
 });
+
+// --- WebSDR source ----------------------------------------------------------
+const WEBSDR_KEY = 'lastWebSDRUrl';
+webSDRUrlInput.value = localStorage.getItem(WEBSDR_KEY) || '';
+
+webBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const open = webBtn.getAttribute('aria-expanded') === 'true';
+  closeAllPops();
+  if (!open) {
+    placePop(popWebSDR, webBtn);
+    webBtn.setAttribute('aria-expanded', 'true');
+    webSDRUrlInput.focus();
+  }
+});
+
+$('webSDRCancel').addEventListener('click', (e) => {
+  e.stopPropagation();
+  closeAllPops();
+});
+
+async function openWebSDR() {
+  const url = webSDRUrlInput.value.trim();
+  if (!url) return;
+  localStorage.setItem(WEBSDR_KEY, url);
+  closeAllPops();
+
+  // Mark the web button as the active source.
+  micBtn.setAttribute('aria-pressed', 'false');
+  fileBtn.setAttribute('aria-pressed', 'false');
+  webBtn.setAttribute('aria-pressed', 'true');
+  try { $('srcLabel').textContent = new URL(url).host; } catch { $('srcLabel').textContent = url; }
+
+  const err = await call('OpenWebSDR', url);
+  if (err) {
+    webBtn.setAttribute('aria-pressed', 'false');
+    $('srcLabel').textContent = 'No source';
+    return;
+  }
+  startDecoding();
+}
+
+$('webSDROpen').addEventListener('click', (e) => { e.stopPropagation(); openWebSDR(); });
+webSDRUrlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') openWebSDR(); });
 
 // --- Record / start-stop -----------------------------------------------------
 $('recBtn').addEventListener('click', () => {

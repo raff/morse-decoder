@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 
+	"morse-decoder/websdr"
+
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -25,8 +27,9 @@ type SpeedConfig struct {
 // App is the object bound to the frontend. Every exported method here becomes
 // callable from JS as window.go.main.App.<Method>(...).
 type App struct {
-	ctx    context.Context
-	engine *Engine
+	ctx        context.Context
+	engine     *Engine
+	webSDRProxy *websdr.Proxy
 }
 
 func NewApp() *App {
@@ -45,6 +48,11 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	// Stop the proxy first — this closes its Done() channel, which unblocks
+	// captureWebSDR so engine.Close() / wg.Wait() can return promptly.
+	if a.webSDRProxy != nil {
+		a.webSDRProxy.Stop()
+	}
 	if a.engine != nil {
 		a.engine.Close()
 	}
@@ -88,6 +96,35 @@ func (a *App) SetSpeed(cfg SpeedConfig) { a.engine.SetSpeed(cfg) }
 
 // Clear resets the decoder's running state / buffers.
 func (a *App) Clear() { a.engine.Clear() }
+
+// OpenWebSDR starts a local reverse-proxy for targetURL, opens it in the
+// system browser (with an injected AudioContext tap), and switches the engine
+// to the WebSDR source.  Calling it again with a different URL restarts the proxy.
+func (a *App) OpenWebSDR(targetURL string) error {
+	// Stop any existing proxy first — closes Done() so captureWebSDR unblocks
+	// before engine.Stop()/wg.Wait() is called.
+	if a.webSDRProxy != nil {
+		a.webSDRProxy.Stop()
+		a.engine.Stop()
+		a.webSDRProxy = nil
+	}
+
+	proxy, err := websdr.New(targetURL)
+	if err != nil {
+		return err
+	}
+	localURL, err := proxy.Start()
+	if err != nil {
+		return err
+	}
+
+	a.webSDRProxy = proxy
+	a.engine.SetWebSDRProxy(proxy)
+	a.engine.SetSource("websdr", "")
+
+	runtime.BrowserOpenURL(a.ctx, localURL)
+	return nil
+}
 
 // ExportText shows a save dialog and writes the decoded text to disk.
 func (a *App) ExportText(text string) error {

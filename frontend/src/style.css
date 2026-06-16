@@ -93,6 +93,10 @@ select { background: var(--panel); color: var(--tx); border: 1px solid var(--lin
 .pop .head { margin: 0 0 12px; font-size: 13px; font-weight: 600; }
 .frow { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
 
+input[type="url"] { width: 100%; background: var(--panel); color: var(--tx); border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; font-size: 13px; font-family: var(--font-mono); outline: none; }
+input[type="url"]:focus { border-color: var(--acc); }
+#popWebSDR { min-width: 300px; }
+
 .devitem { display: block; width: 100%; text-align: left; border: none; background: transparent; color: var(--tx); padding: 8px 10px; border-radius: 8px; font-size: 13px; cursor: pointer; }
 .devitem:hover { background: var(--hov); }
 .devitem[aria-selected="true"] { background: var(--acc); color: var(--bg); }
