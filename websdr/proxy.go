@@ -282,31 +282,41 @@ func (p *Proxy) tapScript() string {
   var orig = AudioNode.prototype.connect;
   AudioNode.prototype.connect = function (dest, outCh, inCh) {
     var ctx = this.context;
-    if (dest === ctx.destination && !ctx.__morseTapped) {
-      ctx.__morseTapped = true;
+    // Tap in parallel: every node that reaches ctx.destination is also fed
+    // into a per-context capture ScriptProcessor. Doing this on *every*
+    // connect (rather than splicing once in series) means a band switch that
+    // tears down and rebuilds the audio graph is picked up automatically —
+    // the freshly created source connects to destination, and we tap it too.
+    if (dest === ctx.destination && this !== ctx.__morseTap) {
+      if (!ctx.__morseTap) {
+        var proc = ctx.createScriptProcessor(4096, 2, 2);
+        proc.onaudioprocess = function (ev) {
+          var ib = ev.inputBuffer;
+          var L = ib.getChannelData(0);
+          var nCh = ib.numberOfChannels;
+          var R = nCh > 1 ? ib.getChannelData(1) : L;
 
-      var proc = ctx.createScriptProcessor(4096, 2, 2);
-      proc.onaudioprocess = function (ev) {
-        // Passthrough so the user still hears the SDR.
-        var L = ev.inputBuffer.getChannelData(0);
-        var nCh = ev.inputBuffer.numberOfChannels;
-        var R = nCh > 1 ? ev.inputBuffer.getChannelData(1) : L;
-        ev.outputBuffer.getChannelData(0).set(L);
-        if (nCh > 1) ev.outputBuffer.getChannelData(1).set(R);
+          // Output silence: the source is already wired straight to
+          // ctx.destination, so this parallel tap must not add a 2nd copy.
+          ev.outputBuffer.getChannelData(0).fill(0);
+          if (ev.outputBuffer.numberOfChannels > 1) ev.outputBuffer.getChannelData(1).fill(0);
 
-        if (ws.readyState !== 1) return;
+          if (ws.readyState !== 1) return;
 
-        // Mix to mono and prepend sample-rate header (uint32 LE).
-        var n = L.length;
-        var buf = new ArrayBuffer(4 + n * 4);
-        new DataView(buf).setUint32(0, ctx.sampleRate, true);
-        var out = new Float32Array(buf, 4);
-        for (var i = 0; i < n; i++) out[i] = (L[i] + R[i]) * 0.5;
-        ws.send(buf);
-      };
-
-      proc.connect(ctx.destination);
-      return orig.call(this, proc, outCh, inCh);
+          // Mix to mono and prepend sample-rate header (uint32 LE).
+          var n = L.length;
+          var buf = new ArrayBuffer(4 + n * 4);
+          new DataView(buf).setUint32(0, ctx.sampleRate, true);
+          var out = new Float32Array(buf, 4);
+          for (var i = 0; i < n; i++) out[i] = (L[i] + R[i]) * 0.5;
+          ws.send(buf);
+        };
+        // Bypass our override for the tap's own wiring to avoid recursion.
+        orig.call(proc, ctx.destination);
+        ctx.__morseTap = proc;
+      }
+      // Feed this source into the tap in parallel, then connect normally.
+      orig.call(this, ctx.__morseTap);
     }
     return orig.call(this, dest, outCh, inCh);
   };

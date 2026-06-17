@@ -62,6 +62,13 @@ and streams the decoded PCM audio back to the app over a local WebSocket
 forwarded transparently, so tuning, mode switching, and all SDR controls work
 normally. No audio is rerouted at the OS level.
 
+The snippet taps the audio graph *in parallel*: every node that connects to
+`ctx.destination` is also fed into a capture node, rather than splicing one tap
+in series the first time it sees a connection. This matters because some servers
+tear down and rebuild their Web Audio graph on a band switch — a one-shot tap
+would be orphaned and go silent, whereas the parallel tap picks up the freshly
+created source automatically.
+
 Compatible with any server built on the **WebSDR** (PA3FWM) software. Other
 platforms (OpenWebRX, KiwiSDR) also use Web Audio API and should work, but
 have not been tested.
