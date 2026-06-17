@@ -31,6 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# macOS
+.DS_Store
+
 # frontend node modules
 node_modules/
 wailsjs/
