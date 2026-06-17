@@ -98,6 +98,18 @@ Noise Reduction adds one extra filter stage to whichever type is selected.
 Squelch sets the Schmitt trigger threshold (0 = most sensitive, 9 = strongest
 signal required).
 
+## Prosigns
+
+Procedural signals — letters keyed together with no inter-character gap — are
+decoded and shown in angle brackets, e.g. `<SK>`, `<BK>`, `<CT>`, `<SOS>`,
+`<AA>`, `<SN>`, `<INT>`, `<HH>` (error), `<CL>`. Because the decoder splits
+characters by timing, the same letters keyed with a normal gap decode as plain
+letters instead.
+
+Four prosigns share the exact Morse code of a punctuation mark and cannot be
+told apart by timing; these render in a combined form so neither meaning is
+lost: `<AS/&>`, `<AR/+>`, `<BT/=>`, `<KN/(>`.
+
 ## Layout
 
 ```

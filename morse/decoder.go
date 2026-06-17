@@ -39,5 +39,5 @@ func (d *Decoder) flushChar() {
 	if code == "" {
 		return
 	}
-	d.output.WriteRune(Lookup(code))
+	d.output.WriteString(Decode(code))
 }
