@@ -544,8 +544,15 @@ func (e *Engine) process(in []float32) {
 	for _, evt := range events {
 		ms := float64(evt.DurationSamples) / float64(e.liveSR) * 1000.0
 		if e.liveMS > 0 && evt.IsTone == e.liveIsTone {
-			// Same polarity as the pending pulse — it was split at the buffer edge.
-			e.liveMS += ms
+			// Same polarity as the pending pulse — it was split at the buffer
+			// edge. SchmittTrigger.count only resets on a real tone/silence
+			// transition, so evt.DurationSamples already IS the cumulative
+			// duration since the pulse started (across however many prior
+			// buffers), not just this buffer's slice of it. Replacing (not
+			// adding) is what keeps this correct; adding double/triple-counts
+			// every pulse that spans more than one buffer — silently but
+			// severely, since buffers are ~43ms and most dashes/gaps exceed that.
+			e.liveMS = ms
 			continue
 		}
 		if e.liveMS > 0 {
@@ -569,10 +576,14 @@ func (e *Engine) process(in []float32) {
 	}
 }
 
-// maxAutoWPM is the ceiling applied to auto speed detection.
-// Anything faster is almost certainly noise rather than a real CW signal.
+// maxAutoWPM/minAutoWPM bound auto speed detection to the same range the
+// manual WPM slider allows. Outside of it is almost certainly noise
+// (implausibly fast) or a noise-stretched gap (implausibly slow) rather
+// than a real CW signal.
 const maxAutoWPM = 50.0
+const minAutoWPM = 5.0
 const minDotMs = 1200.0 / maxAutoWPM // 24 ms
+const maxDotMs = 1200.0 / minAutoWPM // 240 ms
 
 // decodePulse classifies one completed pulse and feeds it to the Morse decoder.
 func (e *Engine) decodePulse(isTone bool, ms float64) {
@@ -634,10 +645,12 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 	}
 }
 
-// clampDotMs ensures the estimator never drifts above maxAutoWPM.
+// clampDotMs ensures the estimator never drifts outside [minAutoWPM, maxAutoWPM].
 func clampDotMs(est *morse.SpeedEstimator) {
 	if est.DotMs < minDotMs {
 		est.DotMs = minDotMs
+	} else if est.DotMs > maxDotMs {
+		est.DotMs = maxDotMs
 	}
 }
 

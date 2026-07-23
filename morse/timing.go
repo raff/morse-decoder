@@ -26,6 +26,15 @@ type SpeedEstimator struct {
 
 // NewEstimator creates a SpeedEstimator.
 // wpmHint > 0 sets a prior; set adaptive=true to allow EMA drift after bootstrap.
+//
+// In adaptive mode, wpmHint (if any) only seeds the k-means bootstrap in
+// Bootstrap — it does NOT mark the estimator as bootstrapped. This matters
+// because IsBootstrapped gates re-estimation from real tone data (see
+// Bootstrap and the engine's decodePulse): if a hint immediately marked the
+// estimator bootstrapped, auto mode would get stuck at the hint's WPM
+// whenever the real transmission differs enough that per-pulse EMA drift
+// (bounded to ~1.8x the current estimate) can't reach it — e.g. starting
+// auto-detect at 20 WPM against a 10 WPM signal never converges.
 func NewEstimator(wpmHint float64, adaptive bool) *SpeedEstimator {
 	e := &SpeedEstimator{
 		baseAlpha: 0.08,
@@ -35,7 +44,9 @@ func NewEstimator(wpmHint float64, adaptive bool) *SpeedEstimator {
 	if wpmHint > 0 {
 		e.DotMs = 1200.0 / wpmHint
 		e.priorMs = e.DotMs
-		e.bootstrapped = true
+		if !adaptive {
+			e.bootstrapped = true
+		}
 	}
 	return e
 }
@@ -249,21 +260,42 @@ func kmeans2(data []float64, priorMs float64) (float64, float64) {
 	for range 50 {
 		var sum1, sum2 float64
 		var n1, n2 int
+		// Track the point that fits its assigned cluster worst, on each side —
+		// used to reseed a cluster that ends up empty this round.
+		var farthestFromC2, farthestFromC1 float64
+		maxD1, maxD2 := -1.0, -1.0
 		for _, v := range data {
-			if math.Abs(v-c1) <= math.Abs(v-c2) {
+			d1, d2 := math.Abs(v-c1), math.Abs(v-c2)
+			if d1 <= d2 {
 				sum1 += v
 				n1++
 			} else {
 				sum2 += v
 				n2++
 			}
+			if d2 > maxD2 {
+				maxD2, farthestFromC2 = d2, v
+			}
+			if d1 > maxD1 {
+				maxD1, farthestFromC1 = d1, v
+			}
 		}
 		newC1, newC2 := c1, c2
 		if n1 > 0 {
 			newC1 = sum1 / float64(n1)
+		} else {
+			// Every point went to c2, leaving c1 stuck at a stale seed with no
+			// data behind it. This happens when a wildly-off prior (e.g. auto
+			// mode inheriting a manual WPM ~2x the real speed) seeds c1/c2
+			// straddling the true dot/dash split so ambiguously that nothing
+			// lands on c1's side. Reseed it from the worst-fit-for-c2 point so
+			// the next round can split the two real clusters apart.
+			newC1 = farthestFromC2
 		}
 		if n2 > 0 {
 			newC2 = sum2 / float64(n2)
+		} else {
+			newC2 = farthestFromC1
 		}
 		if math.Abs(newC1-c1) < 0.01 && math.Abs(newC2-c2) < 0.01 {
 			break

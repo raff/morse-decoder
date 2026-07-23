@@ -3,8 +3,10 @@ package testdata
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
+	"strings"
 	"testing"
 
 	"morse-decoder/audio"
@@ -262,7 +264,12 @@ func encodeStringAtWPM(text string, targetWPM float64) []float64 {
 	dash := dot * 3
 
 	sequences := map[rune]string{
-		'S': "...", 'O': "---",
+		'S': "...", 'O': "---", 'E': ".", 'H': "....", 'L': ".-..",
+		'A': ".-", 'B': "-...", 'C': "-.-.", 'D': "-..", 'F': "..-.",
+		'G': "--.", 'I': "..", 'J': ".---", 'K': "-.-", 'M': "--",
+		'N': "-.", 'P': ".--.", 'Q': "--.-", 'R': ".-.", 'T': "-",
+		'U': "..-", 'V': "...-", 'W': ".--", 'X': "-..-", 'Y': "-.--",
+		'Z': "--..",
 	}
 
 	var samples []float64
@@ -294,6 +301,145 @@ func encodeStringAtWPM(text string, targetWPM float64) []float64 {
 	}
 	writeSilence(&samples, dot*7)
 	return samples
+}
+
+// runAutoDetect mirrors the engine's decodePulse gating in Auto mode: it seeds
+// the estimator with hintWPM (as the manual WPM slider would before Auto is
+// enabled) but relies on Bootstrap — not the hint — to lock in the real speed,
+// then classifies every subsequent pulse adaptively. This is a regression test
+// for a bug where a wrong hint permanently pinned the estimate because
+// NewEstimator marked the estimator "bootstrapped" from the hint alone,
+// starving Bootstrap of the chance to run.
+func runAutoDetect(t *testing.T, samples []float64, sr int, hintWPM float64, label string) (string, float64) {
+	t.Helper()
+
+	bp := dsp.NewBandpass(carrier, 150, sr)
+	filtered := bp.Apply(samples)
+	envelope := dsp.ExtractEnvelope(filtered, sr)
+	normalized := dsp.NormalizeEnvelope(envelope)
+	schmitt := dsp.NewSchmittTrigger()
+	events := schmitt.Process(normalized)
+	minSamples := int(10.0 / 1000.0 * float64(sr))
+	events = dsp.FilterShortPulses(events, minSamples)
+
+	est := morse.NewEstimator(hintWPM, true) // adaptive=true mirrors Auto mode
+	dec := &morse.Decoder{}
+	var toneDurMs []float64
+	for _, e := range events {
+		ms := float64(e.DurationSamples) / float64(sr) * 1000.0
+		if e.IsTone {
+			toneDurMs = append(toneDurMs, ms)
+		}
+		if !est.IsBootstrapped() {
+			if len(toneDurMs) >= 8 {
+				est.Bootstrap(toneDurMs)
+			}
+			continue
+		}
+		dec.Feed(est.Classify(e.IsTone, ms))
+	}
+	result := dec.Flush()
+	t.Logf("%s: hint=%.0f WPM estimated=%.1f WPM decoded=%q", label, hintWPM, est.CurrentWPM(), result)
+	return result, est.CurrentWPM()
+}
+
+// TestAutoWPMAcrossSpeeds verifies Auto mode converges to the real transmission
+// speed — and decodes correctly — across a range of WPMs, all starting from
+// the same fixed hint (20 WPM, the app's default manual speed). Before the fix
+// this passed only for hint-adjacent speeds; 10 and 30 WPM (2x hint in either
+// direction) used to get stuck at 20 WPM forever.
+//
+// A "VVV VVV" sync preamble precedes the real text, standard CW practice for
+// letting a receiver settle on the sender's speed. It also absorbs the live
+// decoder's brief resync window (it doesn't feed the decoder until it has
+// gathered enough tone samples to re-bootstrap), so the pangram itself decodes
+// cleanly rather than losing its first couple of characters to that gap.
+func TestAutoWPMAcrossSpeeds(t *testing.T) {
+	const text = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG"
+	const hintWPM = 20.0
+
+	for _, speed := range []float64{10, 15, 20, 25, 30} {
+		samples := encodeStringAtWPM("VVV VVV "+text, speed)
+		label := fmt.Sprintf("%.0fWPM", speed)
+		result, gotWPM := runAutoDetect(t, samples, sampleRate, hintWPM, label)
+
+		if !strings.HasSuffix(result, text) {
+			t.Errorf("%s: decoded %q, want suffix %q", label, result, text)
+		}
+		if errPct := math.Abs(gotWPM-speed) / speed; errPct > 0.15 {
+			t.Errorf("%s: estimated %.1f WPM (%.0f%% error, want <=15%%)", label, gotWPM, errPct*100)
+		}
+	}
+}
+
+// TestAutoWPMTracksAcceleratingTransmission models a single continuous QSO
+// where the sender speeds up between messages — 10, then 15, then 20, then
+// 25, then 30 WPM — and Auto mode is never reset in between, exactly as the
+// engine behaves in live capture (one SpeedEstimator and one Decoder persist
+// for the whole session; only SetSpeed/Clear rebuild them, and neither
+// happens here). It's a deliberately different failure mode from
+// TestAutoWPMAcrossSpeeds: instead of one bad initial hint, this checks that
+// per-pulse EMA drift (the only mechanism active once bootstrapped) can keep
+// tracking a real operator gradually ramping up speed.
+//
+// Each segment gets a short "VV" lead-in, same reasoning as the sync
+// preamble in TestAutoWPMAcrossSpeeds: right at a speed change the gap
+// thresholds are still calibrated to the old speed, which can misjudge the
+// first character-gap or two. A couple of throwaway dits lets that settle
+// before the real text starts, same as an operator wouldn't ramp up speed
+// mid-word.
+func TestAutoWPMTracksAcceleratingTransmission(t *testing.T) {
+	const text = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG"
+	speeds := []float64{10, 15, 20, 25, 30}
+
+	est := morse.NewEstimator(speeds[0], true) // hint matches the true starting speed
+	dec := &morse.Decoder{}
+	var toneDurMs []float64
+
+	for _, speed := range speeds {
+		samples := encodeStringAtWPM("VV "+text, speed)
+		bp := dsp.NewBandpass(carrier, 150, sampleRate)
+		filtered := bp.Apply(samples)
+		envelope := dsp.ExtractEnvelope(filtered, sampleRate)
+		normalized := dsp.NormalizeEnvelope(envelope)
+		schmitt := dsp.NewSchmittTrigger()
+		events := schmitt.Process(normalized)
+		minSamples := int(10.0 / 1000.0 * float64(sampleRate))
+		events = dsp.FilterShortPulses(events, minSamples)
+
+		for _, e := range events {
+			ms := float64(e.DurationSamples) / float64(sampleRate) * 1000.0
+			if e.IsTone {
+				toneDurMs = append(toneDurMs, ms)
+			}
+			if !est.IsBootstrapped() {
+				if len(toneDurMs) >= 8 {
+					est.Bootstrap(toneDurMs)
+				}
+				continue
+			}
+			dec.Feed(est.Classify(e.IsTone, ms))
+		}
+
+		gotWPM := est.CurrentWPM()
+		t.Logf("end of %.0f WPM segment: estimated=%.1f WPM", speed, gotWPM)
+		if errPct := math.Abs(gotWPM-speed) / speed; errPct > 0.20 {
+			t.Errorf("end of %.0f WPM segment: estimated %.1f WPM (%.0f%% error, want <=20%%)", speed, gotWPM, errPct*100)
+		}
+	}
+
+	// The "VV" lead-ins may decode as noise around each segment boundary, so
+	// check the pangram appears once per segment, in order, rather than an
+	// exact match on the whole (noisy-prefix-included) transcript.
+	got := dec.Flush()
+	pos := 0
+	for i := range speeds {
+		idx := strings.Index(got[pos:], text)
+		if idx < 0 {
+			t.Fatalf("segment %d: %q not found in decoded output after position %d: %q", i, text, pos, got)
+		}
+		pos += idx + len(text)
+	}
 }
 
 // TestRoundTrip writes a WAV file and reads it back, verifying the audio stack.
