@@ -290,12 +290,9 @@ $('recBtn').addEventListener('click', () => {
 $('viewSeg').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   $('viewSeg').querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
-  const v = b.dataset.view, m = $('morseOut');
-  $('textOut').style.display = v === 'morse' ? 'none' : 'block';
-  m.style.display = v === 'text' ? 'none' : 'block';
-  m.style.borderTop = v === 'both' ? '1px dashed var(--line)' : 'none';
-  m.style.marginTop = v === 'both' ? '10px' : '0';
-  m.style.paddingTop = v === 'both' ? '10px' : '0';
+  const v = b.dataset.view;
+  $('textPane').style.display = v === 'morse' ? 'none' : 'block';
+  $('morsePane').style.display = v === 'text' ? 'none' : 'block';
 });
 
 // --- Clear / export ----------------------------------------------------------
@@ -362,11 +359,17 @@ document.addEventListener('mouseup', () => { specDragging = false; });
 if (haveBackend) {
   RT.EventsOn('spectrum', (frame) => { latestBins = frame.bins || []; drawSpectrum(); });
   RT.EventsOn('decoded', (chunk) => {
-    const t = $('textOut'), m = $('morseOut'), pane = t.parentElement;
-    const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 24;
-    if (chunk.text) t.textContent += chunk.text;
-    if (chunk.morse) m.textContent += chunk.morse;
-    if (atBottom) pane.scrollTop = pane.scrollHeight;
+    const t = $('textOut'), m = $('morseOut'), textPane = $('textPane'), morsePane = $('morsePane');
+    if (chunk.text) {
+      const atBottom = textPane.scrollHeight - textPane.scrollTop - textPane.clientHeight < 24;
+      t.textContent += chunk.text;
+      if (atBottom) textPane.scrollTop = textPane.scrollHeight;
+    }
+    if (chunk.morse) {
+      const atBottom = morsePane.scrollHeight - morsePane.scrollTop - morsePane.clientHeight < 24;
+      m.textContent += chunk.morse;
+      if (atBottom) morsePane.scrollTop = morsePane.scrollHeight;
+    }
   });
   RT.EventsOn('status', (s) => {
     $('freqRo').textContent = s.freq;
