@@ -149,7 +149,94 @@ disrupt character boundaries.
 Fix: apply the same minimum-duration check to silences, dropping any silence
 shorter than, say, `0.2 × dotMs` before feeding it to the decoder.
 
-### 11. `srcBtn` has no click handler
+### 11. Mic/USB device disconnect mid-capture cannot be auto-detected safely **[review]**
+
+Turning off (or unplugging) a USB radio while `capture()` is actively
+reading from it used to hang the app (the original bug report). Several
+rounds of fixing this — read-timeout watchdogs, `stream.Abort()` to unblock
+a wedged `Read()`, silence/overflow heuristics — were tried and **all
+reverted**, because they led to real, reproducible app crashes (SIGSEGV)
+instead of just a hang. `capture()` is now back to the simple form: a plain
+loop that calls `stream.Read()` and retries on `portaudio.InputOverflowed`,
+with no timeout and no `Abort()`. This means **the original hang can
+recur** if a device disconnects mid-capture in a way that blocks `Read()`
+forever with no error — see the trade-off note below.
+
+**What we know from real hardware** (a USB-audio radio interface on macOS,
+`github.com/gordonklaus/portaudio@v0.0.0-20260203164431-765aa7dfa631`):
+turning the device off does not simply go silent. The observed sequence on
+every `Read()` after power-off:
+1. One `portaudio.InputOverflowed`, alongside a logged CoreAudio HAL error
+   (`||PaMacCore (AUHAL)|| Error on line 2523: err='-10863', msg=Audio Unit:
+   cannot do in current context`) — this is a hard Audio Unit failure, not a
+   benign transient buffer overflow.
+2. A few more `Read()` calls that return **instantly** (~1µs, far faster
+   than the real ~42ms buffer cadence) with **stale, non-silent** data —
+   the buffer just isn't being refreshed, not zeroed.
+3. Then `Read()` blocks forever.
+
+**Crash signature**: three separate real-app crashes, all `SIGSEGV` inside
+`Pa_ReadStream` (via cgo) called from `capture()`'s reader — and all three
+at the **identical PC** (`0x7ff8107959a9`), which lands in macOS's shared
+dyld cache (system frameworks share one fixed address across all processes
+on a machine, unlike our own dylib). That's strong evidence this is a
+deterministic bug inside Apple's CoreAudio/AudioToolbox code itself (or in
+how PortAudio's PaMacCore/AUHAL backend drives it) when reading from a
+stream whose device has gone away — not memory corruption from our code.
+Since the fault fires inside the C call itself, **no Go-level error
+handling gets a chance to run before it happens**, and a signal arriving
+during cgo execution is unconditionally fatal to the whole process — it
+cannot be caught with `recover()`, on any goroutine.
+
+**Extensive standalone reproduction attempts failed** (see `palist.go`, a
+disposable `//go:build ignore` diagnostic script kept at the repo root,
+*not* part of the build — reuse or extend it for any future investigation
+here rather than instrumenting the app directly). Tested in isolation, none
+of the following crashed, even though each is a close analogue of what the
+real app was doing when it crashed:
+- Calling `stream.Abort()` while a `Read()` is genuinely blocked mid-call
+  (documented as the correct way to unblock it). `Abort()` itself always
+  returned cleanly — but on this hardware it **did not actually unblock**
+  the pending `Read()`; that goroutine just stays leaked, permanently
+  blocked inside `Pa_ReadStream`.
+- Leaving that leaked goroutine idle for minutes with zero further
+  interaction — never crashed spontaneously.
+- Calling `portaudio.Terminate()` + `Initialize()` (i.e. what
+  `ListInputDevices()` does on every dialog open) while that leaked
+  goroutine is still blocked inside the old stream — didn't crash, and
+  correctly showed the device gone from the list, then back once
+  re-enumerated.
+- Opening a brand new second stream on the same physical device afterward,
+  and reading several buffers from it — also didn't crash.
+
+So the crash reproduces reliably in the full Wails app but not in a
+minimal standalone binary running the same PortAudio calls in the same
+sequence. The most likely explanation is that it depends on something
+specific to the app's process — most plausibly concurrent cgo/Objective-C
+activity from the Wails webview itself (native window/webkit machinery is
+heavy on its own C calls) interacting with PortAudio's CoreAudio calls in a
+way this trivial single-purpose binary never exercises. That means further
+"defensive coding" attempts inside `engine.go` can't be reliably validated
+without triggering a real crash in the full app to check — which is exactly
+how the last three regressions happened.
+
+**Current trade-off, accepted for now**: `capture()` stays simple. Worst
+case on a mid-capture disconnect is the pre-existing hang (the goroutine
+blocks in `Read()` forever, `e.stream`/`e.running` never clear, the device
+stays stuck "selected" until app restart) — not a crash. `Stop()`'s
+`shutdownTimeout` bound means the *UI* won't lock up even then, only the
+internal state leaks.
+
+**Real fix (future work)**: isolate the actual PortAudio `Read()` loop in a
+separate OS process (or helper binary), communicating audio buffers back
+over a pipe/socket. If that child process segfaults, only it dies — the
+main app detects the closed connection and reports "device disconnected"
+cleanly instead of taking the whole GUI down. This is the only
+architecturally sound fix given a C-level crash that Go cannot recover
+from; anything short of process isolation is guesswork against a bug we
+can't reproduce on demand.
+
+### 12. `srcBtn` has no click handler
 
 There is a `<button id="srcBtn">` in the status bar (currently shows the
 selected source label). No `addEventListener` is wired to it in `main.js`.
@@ -208,3 +295,7 @@ deferred decision would help more.
   continues running in Go, but events are dropped until the new frontend
   reconnects. This is a Wails v2 limitation; workaround: click Stop before
   making frontend changes in dev mode.
+- **Process-isolated audio capture** — see item 11 above. Moving the
+  PortAudio `Read()` loop into a separate helper process is the only real
+  fix for the mid-capture-disconnect crash; would also make the app
+  resilient to any other PortAudio/CoreAudio-level fault, not just this one.
