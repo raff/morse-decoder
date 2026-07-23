@@ -391,10 +391,14 @@ if (haveBackend) {
     renderRecBtn();
     $('dot').style.background = 'var(--rec)';
     $('statusText').textContent = String(msg).slice(0, 80);
-    // If the device itself was unavailable, deactivate the source button so it
-    // doesn't stay green while pointing at a device that couldn't be opened.
-    if (String(msg).startsWith('device not available:')) {
+    // Capture stopped, so whichever source was active no longer is — clear
+    // its pressed state so the UI doesn't show a stale "connected" source
+    // (e.g. after "device not available:", or a USB device disconnecting
+    // mid-capture) and the user can freely pick another one.
+    if (micBtn.getAttribute('aria-pressed') === 'true' || webBtn.getAttribute('aria-pressed') === 'true') {
       micBtn.setAttribute('aria-pressed', 'false');
+      webBtn.setAttribute('aria-pressed', 'false');
+      $('srcLabel').textContent = 'No source';
     }
   });
 }

@@ -4,6 +4,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gordonklaus/portaudio"
 	"morse-decoder/audio"
@@ -70,9 +71,9 @@ type Engine struct {
 	agcPeak float64
 
 	// WebSDR source state.
-	webSDRProxy  *websdr.Proxy  // non-nil while websdr source is active
-	liveSR       int            // actual sample rate for the live pipeline
-	captureDone  chan struct{}   // closed by Stop() to unblock captureWebSDR
+	webSDRProxy *websdr.Proxy // non-nil while websdr source is active
+	liveSR      int           // actual sample rate for the live pipeline
+	captureDone chan struct{} // closed by Stop() to unblock captureWebSDR
 
 	// Pulse merger: combines partial pulses split at buffer boundaries.
 	liveIsTone bool
@@ -84,8 +85,8 @@ type Engine struct {
 
 	// Tracks how much of dec.Flush()'s output has already been emitted so the
 	// frontend (which appends chunks) never receives duplicate text.
-	lastEmitLen int
-	morseSyms   strings.Builder
+	lastEmitLen  int
+	morseSyms    strings.Builder
 	lastMorseLen int
 }
 
@@ -101,13 +102,57 @@ func NewEngine(emit emitFunc) *Engine {
 // Init must be called once before any device calls (from app.startup).
 func (e *Engine) Init() error { return portaudio.Initialize() }
 
+// shutdownTimeout bounds how long Stop()/Close() wait for the capture
+// goroutine and PortAudio's own teardown calls. A wedged/vanished device can
+// leave low-level PortAudio calls (Abort/Stop/Close/Terminate) blocked at the
+// OS level even after our own read watchdog has given up on it; we'd rather
+// leak that than let it hang app shutdown or the source picker forever.
+// Var (not const) so tests can shrink it instead of waiting out the real value.
+var shutdownTimeout = 5 * time.Second
+
 // Close stops capture and tears down portaudio (from app.shutdown).
 func (e *Engine) Close() {
 	e.Stop()
-	portaudio.Terminate()
+	runBounded(func() { portaudio.Terminate() })
+}
+
+// runBounded runs fn on its own goroutine and returns once it completes or
+// shutdownTimeout elapses, whichever comes first. If it times out, fn keeps
+// running in the background (there is no way to force-cancel a blocked C
+// call) but the caller is no longer stuck waiting on it.
+func runBounded(fn func()) {
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownTimeout):
+	}
 }
 
 func (e *Engine) ListInputDevices() []string {
+	e.mu.Lock()
+	streamOpen := e.stream != nil
+	e.mu.Unlock()
+
+	// PortAudio enumerates devices once at Initialize() and doesn't notice
+	// hotplug changes on its own: a USB radio plugged in after the app
+	// started won't appear, and one that's been turned off won't disappear,
+	// until it's re-initialized. Do that every time the device list is
+	// requested (i.e. every time the picker opens) so it reflects what's
+	// actually connected right now. Skipped while a stream is open —
+	// PortAudio's behavior when Terminate()d mid-stream is undefined, and
+	// nothing needs a rescan while mic capture is already running.
+	if !streamOpen {
+		portaudio.Terminate()
+		if err := portaudio.Initialize(); err != nil {
+			e.emit("error", "portaudio reinit failed: "+err.Error())
+			return nil
+		}
+	}
+
 	devs, err := portaudio.Devices()
 	if err != nil {
 		e.emit("error", err.Error())
@@ -200,7 +245,7 @@ func filterChain(cfg FilterConfig, sr int) dsp.BandpassChain {
 func schmittThresholds(squelch int) (high, low float64) {
 	frac := float64(squelch) / 9.0
 	high = 0.25 + frac*0.55 // 0.25 → 0.80
-	low = high * 0.58        // ~same hysteresis ratio as original defaults
+	low = high * 0.58       // ~same hysteresis ratio as original defaults
 	return
 }
 
@@ -361,17 +406,45 @@ func (e *Engine) Stop() {
 		e.captureDone = nil
 	}
 	e.mu.Unlock()
-	e.wg.Wait()
+	runBounded(e.wg.Wait)
+}
+
+// audioReadStream is the subset of *portaudio.Stream that capture needs.
+// Extracted as an interface so tests can simulate stream behavior without
+// real hardware.
+type audioReadStream interface {
+	Read() error
+	Abort() error
+	Stop() error
+	Close() error
 }
 
 // capture is the live audio loop. The goroutine owns stream teardown.
-func (e *Engine) capture(stream *portaudio.Stream, in []float32) {
+//
+// This intentionally does not try to detect a mid-stream device disconnect
+// (power-off, USB unplug): earlier attempts at that (read-timeout watchdogs,
+// silence heuristics, retry/abort logic around InputOverflowed) ran into a
+// hard wall — on real hardware, PortAudio's Read() can segfault inside its
+// own C call once the underlying Audio Unit has hard-failed, before any of
+// our Go-level error handling even runs. A signal arriving during cgo
+// execution is unconditionally fatal to the whole process; it cannot be
+// caught with recover(), no matter what goroutine it happens on. No amount
+// of defensive Go code around the call can prevent that crash — the only
+// real fix is isolating the PortAudio call in a separate process, which is
+// future work. Until then, keep this loop simple.
+func (e *Engine) capture(stream audioReadStream, in []float32) {
 	defer e.wg.Done()
 	defer func() {
 		stream.Stop()
 		stream.Close()
 		e.mu.Lock()
 		e.stream = nil
+		// This goroutine is the sole authority on whether mic capture is
+		// running. It must clear e.running itself on every exit path —
+		// including ones Stop() never triggered, like a device disconnect —
+		// or Start() silently no-ops forever afterward (its "already
+		// running" guard stays tripped) and the source picker looks stuck.
+		e.running = false
 		e.mu.Unlock()
 		// Flush any partial word that never got a trailing word-gap.
 		if e.dec != nil {
@@ -403,6 +476,13 @@ func (e *Engine) capture(stream *portaudio.Stream, in []float32) {
 func (e *Engine) captureWebSDR(proxy *websdr.Proxy, stopCh <-chan struct{}) {
 	defer e.wg.Done()
 	defer func() {
+		// Same reasoning as capture(): this goroutine owns e.running for the
+		// WebSDR source and must clear it on every exit, including the
+		// proxy.Done() path (e.g. the reverse-proxy connection dying), not
+		// just the Stop()-initiated one — otherwise Start() no-ops forever.
+		e.mu.Lock()
+		e.running = false
+		e.mu.Unlock()
 		if e.dec != nil {
 			e.emitDecoded()
 		}
