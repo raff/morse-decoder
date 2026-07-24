@@ -43,11 +43,16 @@ type Status struct {
 // Engine owns the portaudio capture stream and feeds samples into the decoder.
 type Engine struct {
 	emit emitFunc
+	// onPoisoned, if set, is called once (not under mu) the first time a mic
+	// capture goroutine fails to confirm exit — see everLeaked. Set once at
+	// startup, before any capture runs, so it needs no locking of its own.
+	onPoisoned func()
 
 	mu           sync.Mutex
 	running      bool
 	stream       *portaudio.Stream
 	wg           sync.WaitGroup
+	everLeaked   bool // set once a mic capture goroutine fails to confirm exit within shutdownTimeout; see ListInputDevices
 	devices      []*portaudio.DeviceInfo
 	selected     *portaudio.DeviceInfo
 	selectedName string // the name requested via SetSource; "" means use default
@@ -117,10 +122,11 @@ func (e *Engine) Close() {
 }
 
 // runBounded runs fn on its own goroutine and returns once it completes or
-// shutdownTimeout elapses, whichever comes first. If it times out, fn keeps
-// running in the background (there is no way to force-cancel a blocked C
-// call) but the caller is no longer stuck waiting on it.
-func runBounded(fn func()) {
+// shutdownTimeout elapses, whichever comes first, reporting which happened.
+// If it times out, fn keeps running in the background (there is no way to
+// force-cancel a blocked C call) but the caller is no longer stuck waiting
+// on it.
+func runBounded(fn func()) (completed bool) {
 	done := make(chan struct{})
 	go func() {
 		fn()
@@ -128,23 +134,70 @@ func runBounded(fn func()) {
 	}()
 	select {
 	case <-done:
+		return true
 	case <-time.After(shutdownTimeout):
+		return false
 	}
 }
 
 func (e *Engine) ListInputDevices() []string {
 	e.mu.Lock()
-	streamOpen := e.stream != nil
+	wasCapturing := e.stream != nil
+	poisoned := e.everLeaked
 	e.mu.Unlock()
+
+	// Once a mic capture goroutine has ever failed to confirm exit (see
+	// e.everLeaked / Stop()), it may still be blocked inside a PortAudio C
+	// call. Touching portaudio.Terminate()/Initialize() again risks racing
+	// that still-live call and crashing a totally unrelated, healthy
+	// stream opened afterward — this was reproduced on real hardware after
+	// a few open/close/reselect cycles (SIGSEGV in a *freshly opened*
+	// stream's Read(), not the stuck one). So once poisoned, never touch
+	// PortAudio again for the rest of this run; just report the error and
+	// return whatever the device list last was. See NOTES.md #11.
+	if poisoned {
+		e.emit("error", "can't refresh devices — a previous capture didn't stop cleanly; restart the app to recover")
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		names := make([]string, len(e.devices))
+		for i, d := range e.devices {
+			names[i] = d.Name
+		}
+		return names
+	}
 
 	// PortAudio enumerates devices once at Initialize() and doesn't notice
 	// hotplug changes on its own: a USB radio plugged in after the app
 	// started won't appear, and one that's been turned off won't disappear,
 	// until it's re-initialized. Do that every time the device list is
 	// requested (i.e. every time the picker opens) so it reflects what's
-	// actually connected right now. Skipped while a stream is open —
-	// PortAudio's behavior when Terminate()d mid-stream is undefined, and
-	// nothing needs a rescan while mic capture is already running.
+	// actually connected right now.
+	//
+	// That requires no stream to be open — PortAudio's behavior when
+	// Terminate()d mid-stream is undefined. So if mic capture is active,
+	// stop it first via the same path a user-initiated Stop() takes: it
+	// clears e.running/e.captureDone and then waits (bounded by
+	// shutdownTimeout) for the capture goroutine to actually finish
+	// tearing down its stream, so we're not racing Terminate() against
+	// capture()'s own stream.Stop()/Close() calls. If the goroutine is
+	// genuinely wedged inside a blocked Read() — see NOTES.md #11 — the
+	// wait times out (setting e.everLeaked, handled above on the next
+	// call) and e.stream is still non-nil below, so reinit is skipped this
+	// time too: forcing a wedged Read() to unblock is exactly the class of
+	// interaction that produced the SIGSEGVs documented there.
+	if wasCapturing {
+		e.Stop()
+		// Stop() doesn't tell the frontend anything — it's normally called
+		// right after the frontend already flipped its own button state.
+		// Here the stop was triggered by opening the picker, not a user
+		// click, so the frontend still thinks mic capture is running
+		// unless we tell it otherwise.
+		e.emit("error", "capture stopped to refresh device list")
+	}
+
+	e.mu.Lock()
+	streamOpen := e.stream != nil
+	e.mu.Unlock()
 	if !streamOpen {
 		portaudio.Terminate()
 		if err := portaudio.Initialize(); err != nil {
@@ -400,13 +453,31 @@ func (e *Engine) Stop() {
 		return
 	}
 	e.running = false
+	wasMicStream := e.stream != nil
 	// Unblock captureWebSDR if it is waiting on the audio channel.
 	if e.captureDone != nil {
 		close(e.captureDone)
 		e.captureDone = nil
 	}
 	e.mu.Unlock()
-	runBounded(e.wg.Wait)
+	if !runBounded(e.wg.Wait) && wasMicStream {
+		// The capture goroutine didn't confirm exit in time — it may still
+		// be blocked inside a PortAudio C call (Read/Stop/Close), which per
+		// NOTES.md #11 is a real, observed failure mode on device
+		// disconnect. From here on, calling portaudio.Terminate() again
+		// could race that still-live call and crash an unrelated, healthy
+		// stream — so latch this permanently and have ListInputDevices
+		// refuse to reinit PortAudio for the rest of this run.
+		e.mu.Lock()
+		firstTime := !e.everLeaked
+		e.everLeaked = true
+		e.mu.Unlock()
+		// Fire outside the lock, once, so the app layer can offer to quit —
+		// there's no clean way back from here short of a restart.
+		if firstTime && e.onPoisoned != nil {
+			e.onPoisoned()
+		}
+	}
 }
 
 // audioReadStream is the subset of *portaudio.Stream that capture needs.

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gordonklaus/portaudio"
 	"morse-decoder/websdr"
 )
 
@@ -202,6 +203,47 @@ func TestStopDoesNotHangOnWedgedGoroutine(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop() hung waiting on a wedged goroutine instead of giving up after shutdownTimeout")
+	}
+}
+
+// TestStopLatchesEverLeakedOnlyForWedgedMicStream covers the fix for a
+// crash reported after repeatedly opening/closing the device picker post-
+// disconnect: once a mic capture goroutine fails to confirm exit, further
+// portaudio.Terminate() calls (from ListInputDevices) risk racing that
+// still-live C call and crashing an unrelated, healthy stream — so Stop()
+// must latch e.everLeaked in that case, but only when the wedged capture
+// actually owned a PortAudio stream (e.stream != nil), not e.g. a stuck
+// WebSDR proxy read, which never touches PortAudio at all.
+func TestStopLatchesEverLeakedOnlyForWedgedMicStream(t *testing.T) {
+	origTimeout := shutdownTimeout
+	shutdownTimeout = 100 * time.Millisecond
+	defer func() { shutdownTimeout = origTimeout }()
+
+	e := NewEngine(func(string, interface{}) {})
+	e.running = true
+	e.stream = &portaudio.Stream{} // zero-value stand-in: never Read/Closed in this test
+	e.wg.Add(1)                    // never Done() — stands in for a wedged Read()
+	e.Stop()
+
+	e.mu.Lock()
+	leaked := e.everLeaked
+	e.mu.Unlock()
+	if !leaked {
+		t.Error("Stop() did not latch e.everLeaked after a mic-stream capture failed to confirm exit")
+	}
+
+	// A non-mic (e.g. WebSDR) capture wedging must not poison future
+	// PortAudio reinit — it never touched PortAudio in the first place.
+	e2 := NewEngine(func(string, interface{}) {})
+	e2.running = true
+	e2.wg.Add(1) // never Done(); e2.stream stays nil, as WebSDR capture leaves it
+	e2.Stop()
+
+	e2.mu.Lock()
+	leaked2 := e2.everLeaked
+	e2.mu.Unlock()
+	if leaked2 {
+		t.Error("Stop() latched e.everLeaked for a non-mic-stream capture — should only apply to a wedged PortAudio stream")
 	}
 }
 

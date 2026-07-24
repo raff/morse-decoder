@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"sync/atomic"
 
 	"morse-decoder/websdr"
 
@@ -27,9 +28,10 @@ type SpeedConfig struct {
 // App is the object bound to the frontend. Every exported method here becomes
 // callable from JS as window.go.main.App.<Method>(...).
 type App struct {
-	ctx        context.Context
-	engine     *Engine
-	webSDRProxy *websdr.Proxy
+	ctx          context.Context
+	engine       *Engine
+	webSDRProxy  *websdr.Proxy
+	shuttingDown atomic.Bool
 }
 
 func NewApp() *App {
@@ -42,12 +44,52 @@ func (a *App) startup(ctx context.Context) {
 	a.engine = NewEngine(func(event string, data interface{}) {
 		runtime.EventsEmit(a.ctx, event, data)
 	})
+	a.engine.onPoisoned = func() {
+		if !a.shuttingDown.Load() {
+			go a.promptRestartAfterPoisoned()
+		}
+	}
 	if err := a.engine.Init(); err != nil {
 		runtime.LogError(a.ctx, "portaudio init failed: "+err.Error())
 	}
 }
 
+// promptRestartAfterPoisoned fires once, the first time the engine latches
+// everLeaked (see NOTES.md #11): a mic capture goroutine never confirmed
+// exit, most likely still blocked inside a PortAudio C call. From that
+// point on ListInputDevices() refuses to touch PortAudio again for the
+// rest of this run, so the affected device can't be reselected and the
+// list can't be refreshed — there's no clean way back short of a restart.
+// Other sources (a WAV file, WebSDR, or a different mic device already in
+// the cached list) never call Terminate()/Initialize() and should be
+// unaffected. Runs on its own goroutine since MessageDialog blocks until
+// the user responds.
+func (a *App) promptRestartAfterPoisoned() {
+	result, err := runtime.MessageDialog(a.ctx, runtime.MessageDialogOptions{
+		Type:  runtime.WarningDialog,
+		Title: "Microphone capture didn't stop cleanly",
+		Message: "A USB microphone capture didn't stop cleanly after a disconnect, most likely because the driver is still blocked. " +
+			"That device can't be reselected and the device list can no longer be refreshed for the rest of this session.\n\n" +
+			"Other sources should be unaffected — a WAV file, WebSDR, or a different microphone device already in the list. " +
+			"Restart the app if you need the affected device back.",
+		Buttons:       []string{"Continue", "Quit"},
+		DefaultButton: "Continue",
+		CancelButton:  "Continue",
+	})
+	if err != nil {
+		runtime.LogError(a.ctx, "message dialog failed: "+err.Error())
+		return
+	}
+	if result == "Quit" {
+		runtime.Quit(a.ctx)
+	}
+}
+
 func (a *App) shutdown(ctx context.Context) {
+	// Once shutdown has started, a leak detected by engine.Close()'s own
+	// Stop() call shouldn't pop a "quit?" dialog — the app is already on
+	// its way out.
+	a.shuttingDown.Store(true)
 	// Stop the proxy first — this closes its Done() channel, which unblocks
 	// captureWebSDR so engine.Close() / wg.Wait() can return promptly.
 	if a.webSDRProxy != nil {

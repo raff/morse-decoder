@@ -227,6 +227,97 @@ stays stuck "selected" until app restart) — not a crash. `Stop()`'s
 `shutdownTimeout` bound means the *UI* won't lock up even then, only the
 internal state leaks.
 
+**Update — `ListInputDevices()` now stops capture before reinit**:
+`ListInputDevices()` used to skip the `Terminate()`/`Initialize()` rescan
+entirely whenever `e.stream != nil`, so a disconnect that left `capture()`
+wedged (not erroring, not exiting — the "stale reads then blocks forever"
+sequence above) meant the device stayed in the list forever, and the
+"select device" control stayed showing it as active, until the whole app
+was restarted. `ListInputDevices()` now calls `e.Stop()` first whenever a
+mic stream is open, exactly like a user-initiated stop: it clears
+`e.running`, then waits for the capture goroutine to finish tearing down
+its stream, bounded by `shutdownTimeout`. This closes the fast-path gap —
+if `capture()`'s `Read()` loop is still returning (even with repeated
+`InputOverflowed`), opening the picker now reliably stops it and the
+rescan proceeds — and an `"error"` event is emitted afterward so the
+frontend's existing disconnect-handling path (see `main.js`'s `error`
+listener) resets the mic/web button state, which previously stayed stuck
+"pressed" since nothing told the frontend capture had stopped.
+
+This does **not** change the outcome for a genuinely wedged `Read()`:
+`e.Stop()`'s bounded wait times out the same way it always would, and
+`ListInputDevices()` correctly leaves the stream alone (skips
+`Terminate()`) rather than forcing it — the crash risk described above is
+about forcing a wedged call, and this change deliberately doesn't do that.
+
+One deliberate UX trade-off: opening the device picker now stops mic
+capture even if the current device is perfectly healthy, not just a dead
+one — there's no cheap way to tell those apart without touching the
+stream. Reselecting a device already went through a `Stop()`+`Start()`
+cycle via the frontend's `startDecoding()`, so this mostly just moves that
+interruption earlier (to picker-open instead of device-click) for the
+common case, but it does mean briefly opening the picker to look at what's
+connected now interrupts an active decode.
+
+**Update — a leaked capture goroutine poisons *future*, unrelated streams
+too**: confirmed on real hardware that the above wasn't the whole story.
+After several open/close/reselect cycles post-disconnect, the app crashed
+again — same `SIGSEGV` signature, same PC — but this time inside `Read()`
+on a **freshly opened, healthy stream**, in a goroutine `Start()` had just
+created (not the earlier, presumably-still-wedged one). The likely
+mechanism: once one capture goroutine leaks (blocked forever inside
+`Pa_ReadStream`, per the sequence above), `e.stream` gets overwritten by
+the *next* successful `Start()` and the engine loses all track of that
+orphaned goroutine — but its blocked C call is still live. Any later
+`ListInputDevices()` call that observes `e.stream == nil` (e.g. because
+the *current* capture stopped cleanly) will happily call
+`portaudio.Terminate()`, unaware that an old, invisible leaked read is
+still in flight underneath. `palist.go`'s standalone repro tested exactly
+one `Terminate()`+`Initialize()` against exactly one leaked goroutine and
+found it safe — but the real app can accumulate *multiple* leaks across
+repeated cycles, and each subsequent `Terminate()` is another roll of the
+dice against all of them at once plus whatever concurrent cgo/webview
+activity Wails adds. That combination is apparently what it takes to
+trigger it, which is consistent with why the isolated single-leak repro
+never reproduced it.
+
+Given a leaked capture goroutine can never be confirmed to have gone away
+(there is no way to cancel a blocked C call), the fix is to treat *any*
+observed leak as permanently disqualifying further PortAudio reinit: once
+`Stop()` (called from `ListInputDevices`, the user's Stop button, or
+`Close()`) observes its bounded wait on the capture goroutine time out
+*while a mic stream was open*, it latches `Engine.everLeaked = true` for
+the rest of the process's life. From then on, `ListInputDevices()` skips
+`Stop()`'s bounded wait and `portaudio.Terminate()`/`Initialize()`
+entirely — no more attempts to rescan, and no more repeated
+`shutdownTimeout` (5s) stalls on every picker open, which is also what
+was making the picker "take a very long time" to open: that delay itself
+was the symptom of a leak having already happened. The device list is
+just returned as last known and an error is emitted explaining a restart
+is needed to recover enumeration. This is a strictly more conservative
+version of the existing accepted trade-off (hang over crash) — it now
+also gives up the ability to refresh the list at all, for the whole
+remaining session, rather than just for the one affected device.
+(`everLeaked` only latches when the timed-out capture actually owned a
+PortAudio stream — a stuck WebSDR proxy read, which never touches
+PortAudio, is excluded; see `TestStopLatchesEverLeakedOnlyForWedgedMicStream`
+in `engine_capture_test.go`.)
+
+Confirmed on real hardware: no crash after this, but the poisoned state is
+a dead end as designed — the picker no longer removes the dead device or
+lets it be reselected, and the only way out is restarting the app. Since
+that's now the deliberate behavior rather than a bug, `App` (`app.go`)
+offers to quit the first time `everLeaked` latches: `Engine.onPoisoned`
+fires once (set up in `startup()`), which shows a native Continue/Quit
+dialog via `runtime.MessageDialog` on its own goroutine (it blocks on the
+user's response) and calls `runtime.Quit()` if they choose Quit. It's
+guarded by `App.shuttingDown` so a leak detected during `Close()` itself
+(app already exiting) doesn't pop a dialog on the way out. Other sources
+— a WAV file, WebSDR, or a different mic device still in the cached list
+— never call `Terminate()`/`Initialize()`, so they should keep working
+normally even after poisoning; only the specific device that leaked, and
+re-enumeration in general, are affected.
+
 **Real fix (future work)**: isolate the actual PortAudio `Read()` loop in a
 separate OS process (or helper binary), communicating audio buffers back
 over a pipe/socket. If that child process segfaults, only it dies — the
