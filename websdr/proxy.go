@@ -73,7 +73,14 @@ func New(targetURL string) (*Proxy, error) {
 }
 
 // Start binds to a random local port and serves in the background.
-// Returns the URL the browser should open (http://localhost:PORT/).
+// Returns the URL the browser should open.
+//
+// The target's path, query and fragment are carried over, so a receiver-specific
+// entry point survives the round trip. Several WebSDRs run more than one
+// receiver behind one host and reserve "/" for something else entirely —
+// websdr2.sdrutah.org:8902 serves a "we have moved" page at "/" that bounces
+// the browser to sdrutah.org, with the actual receiver at "/index1a.html".
+// Opening the bare root there drops the user out of the proxy altogether.
 func (p *Proxy) Start() (string, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -82,7 +89,18 @@ func (p *Proxy) Start() (string, error) {
 	p.port = ln.Addr().(*net.TCPAddr).Port
 	p.script = p.tapScript() // port is now fixed; precompute once
 	go p.server.Serve(ln)   //nolint:errcheck
-	return fmt.Sprintf("http://localhost:%d/", p.port), nil
+
+	local := url.URL{
+		Scheme:   "http",
+		Host:     fmt.Sprintf("localhost:%d", p.port),
+		Path:     p.target.Path,
+		RawQuery: p.target.RawQuery,
+		Fragment: p.target.Fragment,
+	}
+	if local.Path == "" {
+		local.Path = "/"
+	}
+	return local.String(), nil
 }
 
 // Stop shuts down the proxy. It closes the done channel so that
@@ -120,6 +138,15 @@ func (p *Proxy) director(r *http.Request) {
 	if r.Header.Get("Referer") != "" {
 		r.Header.Set("Referer", p.target.Scheme+"://"+p.target.Host+"/")
 	}
+	// Suppress client-IP forwarding headers. httputil.ReverseProxy would
+	// otherwise append X-Forwarded-For with our client's address — always
+	// 127.0.0.1, since the browser talks to our local listener. Servers that
+	// trust that header as the real client IP then see a loopback address and
+	// refuse: KiwiSDR (Mongoose) answers 403 Forbidden for the whole site.
+	// Assigning nil (rather than deleting) is what tells ReverseProxy to leave
+	// the header off instead of adding its own.
+	r.Header["X-Forwarded-For"] = nil
+	r.Header.Del("X-Real-IP")
 }
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {
@@ -168,14 +195,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	}
 
 	script := fmt.Sprintf("<script>\n%s\n</script>", p.script)
-	patched := bytes.Replace(body, []byte("</head>"), []byte(script+"\n</head>"), 1)
-	if len(patched) == len(body) {
-		// No </head> — try </body>, then prepend.
-		patched = bytes.Replace(body, []byte("</body>"), []byte(script+"\n</body>"), 1)
-		if len(patched) == len(body) {
-			patched = append([]byte(script+"\n"), body...)
-		}
-	}
+	patched := injectScript(body, script)
 
 	resp.Body = io.NopCloser(bytes.NewReader(patched))
 	resp.ContentLength = int64(len(patched))
@@ -187,6 +207,117 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	resp.Header.Del("Content-Encoding")
 	resp.Header.Del("Transfer-Encoding")
 	return nil
+}
+
+// injectScript places script at the earliest safe point in body: immediately
+// after the opening <head> tag, falling back through </head>, <body>, </body>,
+// <html> and finally a doctype-safe prepend.
+//
+// It no longer prefers "</head>" as the anchor. Several WebSDR installations
+// (na5b.com:8901 among them) carry a commented-out boilerplate block near the
+// top of the page:
+//
+//	<head>
+//	<title>…</title>
+//	<!-- <style> … </style>
+//	</head> -->
+//	<body>
+//
+// The first literal "</head>" there is inside the comment, so injecting before
+// it buries the tap script where the browser never parses it — the page loads
+// and plays audio normally, but no samples ever reach the proxy.
+//
+// Injecting at the top of <head> also guarantees the AudioNode.prototype.connect
+// override is installed before any of the page's own scripts build an audio graph.
+func injectScript(body []byte, script string) []byte {
+	// Anchors in preference order. Each returns an offset to splice at, or -1.
+	// The "</head>" / "</body>" entries reproduce the original (pre-fix) anchors
+	// so that pages which omit the optional <head> open tag still get the script
+	// where they always did — just skipping any anchor buried in a comment.
+	for _, anchor := range []func([]byte) int{
+		func(b []byte) int { return afterOpenTag(b, "<head") },
+		func(b []byte) int { return indexTagOutsideComment(b, "</head>") },
+		func(b []byte) int { return afterOpenTag(b, "<body") },
+		func(b []byte) int { return indexTagOutsideComment(b, "</body>") },
+		func(b []byte) int { return afterOpenTag(b, "<html") },
+		// Last resort: after any doctype, so we never push the doctype down and
+		// flip the page into quirks mode.
+		afterDoctype,
+	} {
+		if at := anchor(body); at >= 0 {
+			out := make([]byte, 0, len(body)+len(script)+1)
+			out = append(out, body[:at]...)
+			out = append(out, '\n')
+			out = append(out, script...)
+			return append(out, body[at:]...)
+		}
+	}
+	return append([]byte(script+"\n"), body...)
+}
+
+// afterOpenTag returns the offset just past the '>' of the first live (not
+// commented-out) occurrence of the given open tag, or -1.
+func afterOpenTag(body []byte, tag string) int {
+	i := indexTagOutsideComment(body, tag)
+	if i < 0 {
+		return -1
+	}
+	gt := bytes.IndexByte(body[i:], '>')
+	if gt < 0 {
+		return -1
+	}
+	return i + gt + 1
+}
+
+// afterDoctype returns the offset just past a leading <!DOCTYPE …> declaration,
+// or 0 if there is none.
+func afterDoctype(body []byte) int {
+	i := 0
+	for i < len(body) && (body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n') {
+		i++
+	}
+	if !bytes.HasPrefix(bytes.ToLower(body[i:]), []byte("<!doctype")) {
+		return 0
+	}
+	gt := bytes.IndexByte(body[i:], '>')
+	if gt < 0 {
+		return 0
+	}
+	return i + gt + 1
+}
+
+// indexTagOutsideComment returns the offset of the first occurrence of tag
+// that is not inside an HTML comment, or -1 if there is none. Matching is
+// case-insensitive. For a partial tag such as "<head" (no trailing '>') the
+// match must end on '>' or whitespace, so "<header" does not count as "<head".
+func indexTagOutsideComment(body []byte, tag string) int {
+	lower := bytes.ToLower(body)
+	t := []byte(tag)
+	needBoundary := t[len(t)-1] != '>'
+	for i := 0; i < len(lower); {
+		if bytes.HasPrefix(lower[i:], []byte("<!--")) {
+			end := bytes.Index(lower[i+4:], []byte("-->"))
+			if end < 0 {
+				return -1 // unterminated comment: nothing past it is live markup
+			}
+			i += 4 + end + 3
+			continue
+		}
+		if bytes.HasPrefix(lower[i:], t) {
+			n := i + len(t)
+			if !needBoundary {
+				return i
+			}
+			if n < len(lower) {
+				switch lower[n] {
+				case '>', ' ', '\t', '\r', '\n':
+					return i
+				}
+			}
+		}
+		i++
+	}
+	return -1
 }
 
 // ── WebSocket: our audio tap receiver ───────────────────────────────────────
