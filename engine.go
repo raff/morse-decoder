@@ -81,12 +81,17 @@ type Engine struct {
 	captureDone chan struct{} // closed by Stop() to unblock captureWebSDR
 
 	// Pulse merger: combines partial pulses split at buffer boundaries.
-	liveIsTone bool
-	liveMS     float64
+	liveIsTone    bool
+	liveMS        float64
+	charGapPeeked bool // set once the char-flush peek has fired for the current silence run
+	wordGapPeeked bool // set once the word-space peek has fired for the current silence run
 
-	// Tone/silence durations collected for bootstrap and gap calibration.
-	toneDurMs []float64
-	silDurMs  []float64
+	// Tone/silence durations collected for bootstrap and gap calibration,
+	// windowed by durationWindowMs rather than entry count — see appendDur.
+	toneDurMs    []float64
+	silDurMs     []float64
+	toneDurSumMs float64 // running sum of toneDurMs, kept for O(1) amortised trimming
+	silDurSumMs  float64 // running sum of silDurMs
 
 	// Tracks how much of dec.Flush()'s output has already been emitted so the
 	// frontend (which appends chunks) never receives duplicate text.
@@ -332,17 +337,23 @@ func (e *Engine) initLiveDecoder(filter FilterConfig, speed SpeedConfig, sr int)
 	e.agcPeak = 1e-6
 	e.liveIsTone = false
 	e.liveMS = 0
+	e.charGapPeeked = false
+	e.wordGapPeeked = false
 	e.lastEmitLen = 0
 	e.morseSyms.Reset()
 	e.lastMorseLen = 0
 	e.toneDurMs = nil
 	e.silDurMs = nil
+	e.toneDurSumMs = 0
+	e.silDurSumMs = 0
 }
 
 // emitDecoded flushes any new text and morse content to the frontend.
 // Safe to call speculatively — emits nothing when there is no new content.
+// Uses Peek (untrimmed) rather than Flush so a trailing inter-word space is
+// emitted as soon as it's fed instead of waiting for more text to follow it.
 func (e *Engine) emitDecoded() {
-	full := e.dec.Flush()
+	full := e.dec.Peek()
 	morseFull := e.morseSyms.String()
 	text, morseChunk := "", ""
 	if len(full) > e.lastEmitLen {
@@ -711,17 +722,40 @@ func (e *Engine) process(in []float32) {
 		}
 		e.liveIsTone = evt.IsTone
 		e.liveMS = ms
+		if evt.IsTone {
+			e.charGapPeeked = false
+			e.wordGapPeeked = false
+		}
 	}
 
-	// Peek at the pending silence: if it has grown to at least char-gap length,
-	// flush the current character to the decoder output and emit now rather than
-	// waiting for the next incoming tone to complete the silence pulse.
-	// We only peek for char gaps (not word gaps) to avoid accumulating extra
-	// spaces in the decoder output on each successive buffer.
-	// Feeding SymCharGap is idempotent: once current is empty, flushChar is a no-op.
+	// Peek at the pending silence and emit early rather than waiting for the
+	// next incoming tone to complete the silence pulse. Two independent
+	// stages, since the word-gap threshold is crossed on a later buffer than
+	// the char-gap threshold within the same silence run:
+	//   1. Once silence reaches char-gap length, flush the completed
+	//      character (charGapPeeked). Always fed as SymCharGap regardless of
+	//      the real classification — its only job is the idempotent
+	//      character flush, not the word-space decision below.
+	//   2. Once silence reaches word-gap length, feed the real classified
+	//      symbol so Decoder.Feed inserts the inter-word space
+	//      (wordGapPeeked). Feed is idempotent for SymWordGap, so the real
+	//      completion event later in decodePulse won't double it.
+	// Each flag is set once per silence run and reset when a new tone starts.
 	if !e.liveIsTone && e.liveMS > 0 && e.est != nil && e.est.IsBootstrapped() {
-		if sym := e.est.Classify(false, e.liveMS); sym.Type == morse.SymCharGap {
+		sym := e.est.Classify(false, e.liveMS)
+		isGap := sym.Type == morse.SymCharGap || sym.Type == morse.SymWordGap
+		changed := false
+		if isGap && !e.charGapPeeked {
+			e.dec.Feed(morse.Symbol{Type: morse.SymCharGap, Ms: e.liveMS})
+			e.charGapPeeked = true
+			changed = true
+		}
+		if sym.Type == morse.SymWordGap && !e.wordGapPeeked {
 			e.dec.Feed(sym)
+			e.wordGapPeeked = true
+			changed = true
+		}
+		if changed {
 			e.emitDecoded()
 		}
 	}
@@ -753,19 +787,16 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 		if ms < threshold {
 			return
 		}
+	} else if e.est.DotMs > 0 && ms < 0.2*e.est.DotMs {
+		// Drop noise-spike silences the same way: too short to be a real
+		// intra-char/char/word gap, just a rapid on/off flicker.
+		return
 	}
 
-	const maxDurs = 500 // cap to keep BootstrapGaps O(1) amortised
 	if isTone {
-		e.toneDurMs = append(e.toneDurMs, ms)
-		if len(e.toneDurMs) > maxDurs {
-			e.toneDurMs = e.toneDurMs[len(e.toneDurMs)-maxDurs:]
-		}
+		e.toneDurMs = appendDur(e.toneDurMs, &e.toneDurSumMs, ms)
 	} else {
-		e.silDurMs = append(e.silDurMs, ms)
-		if len(e.silDurMs) > maxDurs {
-			e.silDurMs = e.silDurMs[len(e.silDurMs)-maxDurs:]
-		}
+		e.silDurMs = appendDur(e.silDurMs, &e.silDurSumMs, ms)
 	}
 
 	// Bootstrap speed estimator once enough tone samples are available.
@@ -794,6 +825,27 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 	if sym.Type == morse.SymCharGap || sym.Type == morse.SymWordGap {
 		e.emitDecoded()
 	}
+}
+
+// durationWindowMs bounds toneDurMs/silDurMs by cumulative duration rather
+// than entry count, so a mid-session speed change rotates out stale data in
+// ~30s instead of waiting out a fixed 500-entry cap (which could hold up to
+// ~100s of data from a different WPM before it fully cycled out).
+const durationWindowMs = 30_000
+
+// appendDur appends ms to durs, trimming from the front to keep the window's
+// cumulative duration at or under durationWindowMs. sum is durs' running
+// total, tracked by the caller so trimming stays O(1) amortised rather than
+// re-summing the slice on every call. Always keeps at least one entry, even
+// if it alone exceeds the window (e.g. one very long pause).
+func appendDur(durs []float64, sum *float64, ms float64) []float64 {
+	durs = append(durs, ms)
+	*sum += ms
+	for len(durs) > 1 && *sum > durationWindowMs {
+		*sum -= durs[0]
+		durs = durs[1:]
+	}
+	return durs
 }
 
 // clampDotMs ensures the estimator never drifts outside [minAutoWPM, maxAutoWPM].

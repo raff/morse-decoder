@@ -23,14 +23,28 @@ func (d *Decoder) Feed(sym Symbol) {
 		d.flushChar()
 	case SymWordGap:
 		d.flushChar()
-		d.output.WriteByte(' ')
+		// Idempotent: only add a space if the output doesn't already end
+		// with one, so feeding SymWordGap twice for the same gap (e.g. an
+		// early speculative peek followed by the real completion event)
+		// doesn't produce a double space.
+		if s := d.output.String(); len(s) > 0 && s[len(s)-1] != ' ' {
+			d.output.WriteByte(' ')
+		}
 	}
+}
+
+// Peek returns the decoded output so far, flushing any character currently
+// in progress but — unlike Flush — without trimming trailing whitespace.
+// Used for progressive display so an inter-word space shows up as soon as
+// it's fed rather than being trimmed away until more text follows it.
+func (d *Decoder) Peek() string {
+	d.flushChar()
+	return d.output.String()
 }
 
 // Flush finalises any buffered character and returns the full decoded string.
 func (d *Decoder) Flush() string {
-	d.flushChar()
-	return strings.TrimSpace(d.output.String())
+	return strings.TrimSpace(d.Peek())
 }
 
 func (d *Decoder) flushChar() {

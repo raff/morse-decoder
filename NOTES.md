@@ -23,37 +23,38 @@ written as a standalone CLI (`morse-decoder-engine`).
 
 ## Known issues
 
-### 1. Char-gap peek feeds the decoder every buffer **[review]**
+### 1. Char-gap peek feeds the decoder every buffer — **[fixed]**
 
-In `process()`, at the end of each buffer, if the pending silence has grown
-past char-gap length, `SymCharGap` is fed to the decoder to flush the current
-character immediately rather than waiting for the next tone.
+Fixed: `Engine.charGapPeeked` (`engine.go`) is set on the first peek for a
+given silence run and reset when a new tone starts, so the peek now fires
+exactly once per silence transition instead of on every buffer.
 
-This is **idempotent** (once `current` is empty, `flushChar` is a no-op), but
-it fires on every single buffer for the entire duration of any silence that
-exceeds `2 × dotMs`. This creates noise in the internal decoder state and
-wastes CPU.
+### 2. Word space only appears when the next word starts — **[fixed]**
 
-Fix: add a `charGapPeeked bool` flag that is set on the first peek for a
-given silence run and reset when a new tone starts. That way the peek fires
-exactly once per silence transition.
+Fixed. Turned out a single peek flag (as originally proposed here) wasn't
+enough: the word-gap threshold is crossed on a *later* buffer than the
+char-gap threshold within the same silence run, so by the time silence is
+long enough to be a word gap, the one flag from item 1 was already spent.
 
-### 2. Word space only appears when the next word starts
+The actual fix, in `engine.go`/`morse/decoder.go`:
+- A second flag, `wordGapPeeked`, gates the word-space peek independently of
+  `charGapPeeked`, both reset when a new tone starts.
+- `Decoder.Feed(SymWordGap)` (`morse/decoder.go`) is now idempotent — it only
+  writes a space if the output doesn't already end with one — so an early
+  speculative peek and the real completion event later in `decodePulse` can
+  both feed the same gap without producing a double space.
+- Added `Decoder.Peek()`, which flushes any in-progress character like
+  `Flush()` but doesn't trim trailing whitespace; `emitDecoded` now diffs
+  against `Peek()` instead of `Flush()` so a trailing inter-word space shows
+  up immediately instead of being trimmed away until more text follows it.
+  `Flush()` itself is now just `TrimSpace(Peek())`.
 
-A word gap is only decoded (and the space emitted) when the silence
-*completes* — i.e. when the next tone begins and `decodePulse` is called.
-During a long inter-word pause (or at end of transmission), the space isn't
-shown until either the next word starts or the user clicks Stop (which
-triggers the final-flush in `capture()`'s defer).
+One accepted cosmetic side effect: if a live session ends exactly on a word
+gap, the final decoded text can carry one trailing space. Invisible in the
+UI (`#textOut` is `white-space:pre-wrap`), so not worth guarding against.
 
-This is mostly harmless in practice, but it means text like "SOS DE W1AW"
-shows "SOS DE W1AW" all at once when the next character starts, not
-progressively with the inter-word space appearing in real-time.
-
-Fix: extend the char-gap peek to also fire for `SymWordGap`, but only once
-(use the same flag as item 1 above). Handling the extra decoder space cleanly
-requires either tracking `lastEmitLen` against the un-trimmed output or adding
-a `Peek()` method to `Decoder` that returns current output without flushing.
+Regression test: `TestLiveWordSpaceEmittedDuringPause` in
+`engine_wordspace_test.go`.
 
 ### 3. AGC toggle not implemented
 
@@ -81,23 +82,29 @@ keeping the target carrier intact.
 This is non-trivial to implement robustly. For now it silently degrades to
 Bandpass. **[review]** Either implement or remove from the dropdown.
 
-### 5. No live carrier tracking
+### 5. No live carrier tracking — **[fixed]**
 
-The bandpass filter is tuned to `filter.Center` (set by the UI slider, default
-700 Hz) and never updated automatically during live capture. The spectrum
-display shows the Goertzel peak frequency, which may not match the filter
-center — if the user's signal is at 800 Hz but the slider is at 700 Hz, the
-filter is 100 Hz off and decoding quality degrades.
+Went with the "lock button + visual warning" option rather than full
+auto-tracking (an EMA continuously chasing the Goertzel peak was judged too
+invasive: needs a new config toggle, backend loop, and risks chasing noise or
+fighting a manual drag). Frontend-only change, `frontend/src/main.js`:
 
-In file mode this is handled by `dsp.DetectCarrier()` (FFT on the whole file
-before filtering). For live mode there's no equivalent.
+- `status.freq` (the Goertzel peak, already computed backend-side) is now
+  tracked client-side as `state.freqNow`.
+- `updateFreqWarn()` colors `#freqRo` (`.ro.warn`, `style.css`) when the peak
+  has drifted more than half the bandwidth from `filter.Center` — i.e. off
+  the edge of the passband — and enables/disables the new lock button
+  accordingly. Wired into the `status` handler, `pushFilter()`, and
+  `renderRecBtn()` so it stays in sync with filter changes and run state.
+- The new `#lockFreqBtn` (target icon, next to the Freq readout) sets
+  `filter.Center` to the current peak in one click. Reuses the same
+  clamp/step/push logic the spectrum-drag handler already used — extracted
+  into `setCenter()` so both share it instead of duplicating the logic.
 
-Fix options:
-- Auto-update `filter.Center` based on the Goertzel peak frequency, perhaps
-  with a slow EMA to avoid chasing noise.
-- Add a "Lock to detected" button in the UI.
-- Display a visual warning when the spectrum peak and filter center diverge
-  significantly.
+Not visually verified in a running window — no headless browser or Wails
+driver was available in this environment to screenshot it; verified via a
+clean `vite build` and by tracing the logic. Worth an eyeball in `wails dev`
+before considering this fully done.
 
 ### 6. Bootstrap delay at start of live session
 
@@ -112,25 +119,27 @@ and bootstrap is immediate — no characters are lost.
 The practical takeaway: **always set a manual WPM if you know the operator's
 approximate speed**.
 
-### 7. Speed estimator EMA α-boost can be triggered by noise
+### 7. Speed estimator EMA α-boost can be triggered by noise — **[fixed]**
 
-When a tone's duration deviates from `DotMs` by more than 30%, the adaptive
-EMA raises its learning rate to α = 0.25 (the "speed change" response). A
-single noise burst that slips through the noise gate and is classified as a
-short dot triggers this, potentially moving `DotMs` noticeably in one step,
-even though the noise gate and 50 WPM cap limit the damage.
+(Note: by the time this was fixed, the boosted α had already been tuned down
+to 0.15 in an earlier commit — the α = 0.25 figure above was stale.)
 
-A stricter guard: only boost α if the *last N* consecutive dots all show the
-same directional deviation, indicating a genuine speed change rather than a
-one-off outlier.
+Fixed in `morse/timing.go`: `update()` now tracks `devDir`/`devStreak`, the
+direction and length of the current run of same-direction >30% deviations.
+The boosted α only kicks in once `speedChangeStreak` (3) consecutive dots
+deviate the same way; a single outlier, or a normal dot in between, resets
+the streak. Regression tests in `morse/timing_test.go`:
+`TestUpdateIgnoresSingleOutlier`, `TestUpdateBoostsOnSustainedSpeedChange`.
 
-### 8. `toneDurMs` / `silDurMs` not a true sliding window
+### 8. `toneDurMs` / `silDurMs` not a true sliding window — **[fixed]**
 
-The slices are capped at 500 entries, but `BootstrapGaps` is always called
-with the full cap. If an operator changes speed mid-session, old duration data
-from a different WPM remains in the buffer and pollutes the k-means until it
-rotates out (500 silences × ~200 ms average ≈ 100 s). A proper sliding window
-(e.g. last 30 s of data, or weighted by recency) would respond faster.
+Fixed in `engine.go`: `appendDur()` replaces the fixed 500-entry cap with a
+`durationWindowMs` (30s) cumulative-duration window, trimming from the front
+of the slice and tracking a running sum (`toneDurSumMs`/`silDurSumMs`) so
+trimming stays O(1) amortised rather than re-summing on every call. A
+mid-session speed change now rotates out in ~30s instead of the old cap's
+worst case of ~100s. Regression tests in `engine_durwindow_test.go`:
+`TestAppendDurTrimsByDuration`, `TestAppendDurKeepsAtLeastOneEntry`.
 
 ### 9. `wails dev` may still lack the microphone permission key
 
@@ -139,15 +148,11 @@ rotates out (500 silences × ~200 ms average ≈ 100 s). A proper sliding window
 `build/darwin/Info.dev.plist` (generated by Wails if it exists). If mic capture
 fails only in dev mode but works in a built `.app`, add the same key there.
 
-### 10. Silence noise pulses not filtered
+### 10. Silence noise pulses not filtered — **[fixed]**
 
-The noise gate in `decodePulse` drops very short *tone* pulses before they
-reach the estimator. Short *silence* pulses (noise spikes alternating rapidly)
-are not filtered — they pass through as `SymIntraGap` or `SymCharGap` and can
-disrupt character boundaries.
-
-Fix: apply the same minimum-duration check to silences, dropping any silence
-shorter than, say, `0.2 × dotMs` before feeding it to the decoder.
+Fixed: `decodePulse` (`engine.go`) now drops silences shorter than
+`0.2 × DotMs`, mirroring the existing tone noise gate, before they reach
+`silDurMs`/the decoder.
 
 ### 11. Mic/USB device disconnect mid-capture cannot be auto-detected safely **[review]**
 
@@ -327,12 +332,11 @@ architecturally sound fix given a C-level crash that Go cannot recover
 from; anything short of process isolation is guesswork against a bug we
 can't reproduce on demand.
 
-### 12. `srcBtn` has no click handler
+### 12. `srcBtn` has no click handler — **[fixed]**
 
-There is a `<button id="srcBtn">` in the status bar (currently shows the
-selected source label). No `addEventListener` is wired to it in `main.js`.
-Either add a click handler (e.g. re-open the source picker) or change it to
-a non-interactive `<span>`.
+Fixed: `#srcBtn` (`frontend/index.html`) is now a non-interactive `<span>`
+(reusing the existing `.lab` style) instead of a `<button>` with no
+handler.
 
 ---
 

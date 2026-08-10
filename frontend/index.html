@@ -62,7 +62,7 @@
 
     <div class="spec-row">
       <span id="waveIcon"></span>
-      <span class="grp" style="gap:4px;"><span class="lab">Freq</span><span class="ro" id="freqRo">700</span><span class="lab" style="color:var(--tx3)">Hz</span></span>
+      <span class="grp" style="gap:4px;"><span class="lab">Freq</span><span class="ro" id="freqRo">700</span><span class="lab" style="color:var(--tx3)">Hz</span><button class="ic" id="lockFreqBtn" style="width:26px;height:26px;flex:none;" aria-label="Set filter center to detected frequency" title="Set filter center to detected frequency"></button></span>
       <canvas id="spec" width="600" height="34"></canvas>
       <span class="meter" id="meter">−42 dB</span>
     </div>
@@ -85,7 +85,7 @@
     <div class="statusbar">
       <div class="grp" style="gap:10px;">
         <button class="sbtn" id="clearBtn">Clear</button>
-        <button class="sbtn" id="srcBtn"><span id="srcLabel">No source</span></button>
+        <span class="lab" id="srcBtn"><span id="srcLabel">No source</span></span>
       </div>
       <button class="ic" id="exportBtn" style="width:30px;height:30px;" aria-label="Export decoded text"></button>
     </div>

@@ -25,6 +25,7 @@ const icons = {
   export: SVG('<path d="M14 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8"/><path d="M11 12h10"/><path d="M18 9l3 3-3 3"/>'),
   chevron: SVG('<path d="M6 9l6 6 6-6"/>'),
   wave: SVG('<path d="M3 12h2l2-6 4 12 3-9 2 3h5"/>'),
+  target: SVG('<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/>'),
   sun: SVG('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/>'),
   moon: SVG('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
   play: SVG('<polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/>'),
@@ -37,6 +38,7 @@ $('webBtn').innerHTML = icons.web;
 $('exportBtn').innerHTML = icons.export;
 $('filtChevron').innerHTML = icons.chevron;
 $('waveIcon').innerHTML = icons.wave;
+$('lockFreqBtn').innerHTML = icons.target;
 // recBtn icon is set by renderRecBtn() below
 
 // --- State -------------------------------------------------------------------
@@ -44,7 +46,7 @@ const md = $('md');
 const state = {
   sq: 3, wpm: 20, auto: false, running: false,
   ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true,
-  theme: 'light', device: null, detected: 0,
+  theme: 'light', device: null, detected: 0, freqNow: 0,
 };
 const cfg = {
   sq: { min: 0, max: 9, step: 1 },
@@ -58,6 +60,17 @@ function pushFilter() {
     type: state.ftype, center: state.fcenter, bandwidth: state.fbw,
     squelch: state.sq, noiseRed: state.nr,
   });
+  updateFreqWarn();
+}
+
+// Flags a filter center that has drifted from the detected carrier (more
+// than half the bandwidth away — i.e. the peak has left the passband) and
+// enables the lock-to-detected button whenever there's something to lock to.
+function updateFreqWarn() {
+  const active = state.running && state.freqNow > 0;
+  const diverged = active && state.ftype !== 'None' && Math.abs(state.freqNow - state.fcenter) > state.fbw / 2;
+  $('freqRo').classList.toggle('warn', diverged);
+  $('lockFreqBtn').disabled = !active;
 }
 function pushSpeed() { call('SetSpeed', { wpm: state.wpm, auto: state.auto }); }
 
@@ -105,6 +118,7 @@ function renderRecBtn() {
   $('dot').style.background = state.running ? 'var(--acc)' : 'var(--tx3)';
   $('statusText').textContent = state.running ? 'Listening' : 'Idle';
   renderWpm();
+  updateFreqWarn();
 }
 
 // Stop (if running) then start with whatever source is currently configured.
@@ -338,22 +352,27 @@ let specDragging = false;
 function freqFromPointer(clientX) {
   const rect = cv.getBoundingClientRect();
   const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
-  const raw = (x / rect.width) * (SPEC_FMAX - SPEC_FMIN) + SPEC_FMIN;
-  const c = cfg.fcenter;
-  return Math.max(c.min, Math.min(c.max, Math.round(raw / c.step) * c.step));
+  return (x / rect.width) * (SPEC_FMAX - SPEC_FMIN) + SPEC_FMIN;
 }
 
-function applySpecCenter(clientX) {
-  state.fcenter = freqFromPointer(clientX);
+// Sets the filter center (clamped/stepped like the UI stepper) and pushes it.
+// Shared by dragging the spectrum and the lock-to-detected button.
+function setCenter(hz) {
+  const c = cfg.fcenter;
+  state.fcenter = Math.max(c.min, Math.min(c.max, Math.round(hz / c.step) * c.step));
   document.querySelector('.step[data-key="fcenter"] .sv').textContent = state.fcenter;
   summary();
   drawSpectrum();
   pushFilter();
 }
 
+function applySpecCenter(clientX) { setCenter(freqFromPointer(clientX)); }
+
 cv.addEventListener('mousedown', (e) => { specDragging = true; applySpecCenter(e.clientX); });
 document.addEventListener('mousemove', (e) => { if (specDragging) applySpecCenter(e.clientX); });
 document.addEventListener('mouseup', () => { specDragging = false; });
+
+$('lockFreqBtn').addEventListener('click', () => { if (state.freqNow > 0) setCenter(state.freqNow); });
 
 // --- Events from the backend -------------------------------------------------
 if (haveBackend) {
@@ -375,7 +394,9 @@ if (haveBackend) {
     $('freqRo').textContent = s.freq;
     $('meter').textContent = s.levelDb + ' dB';
     state.detected = s.wpm;
+    state.freqNow = s.freq;
     renderWpm();
+    updateFreqWarn();
   });
   RT.EventsOn('done', () => {
     // File decode finished — reset to idle so the button returns to play.

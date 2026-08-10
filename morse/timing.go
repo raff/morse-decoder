@@ -19,6 +19,9 @@ type SpeedEstimator struct {
 	adaptive     bool
 	bootstrapped bool
 
+	devDir    int // sign of the last update()'s deviation from DotMs (-1, 0, +1)
+	devStreak int // consecutive update() calls with the same devDir beyond the deviation threshold
+
 	// Gap thresholds set by BootstrapGaps; zero means fall back to dot-ratio rules.
 	charGapThreshMs float64 // boundary between intra-char and char-gap
 	wordGapThreshMs float64 // boundary between char-gap and word-gap
@@ -138,12 +141,32 @@ func (e *SpeedEstimator) Bootstrap(toneDurationsMs []float64) {
 	e.bootstrapped = true
 }
 
+// speedChangeStreak is how many consecutive dots must deviate from DotMs in
+// the same direction before update() treats it as a genuine speed change
+// rather than a single noise burst that slipped past the noise gate.
+const speedChangeStreak = 3
+
 // update adjusts the dot estimate via EMA using a newly observed dot-classified tone.
 // Only called when adaptive mode is on.
 func (e *SpeedEstimator) update(toneMs float64) {
-	residual := math.Abs(toneMs-e.DotMs) / e.DotMs
+	residual := (toneMs - e.DotMs) / e.DotMs
+	dir := 0
 	if residual > 0.30 {
-		e.alpha = 0.15 // temporary boost: sender changed speed
+		dir = 1
+	} else if residual < -0.30 {
+		dir = -1
+	}
+
+	if dir != 0 && dir == e.devDir {
+		e.devStreak++
+	} else if dir != 0 {
+		e.devDir, e.devStreak = dir, 1
+	} else {
+		e.devDir, e.devStreak = 0, 0
+	}
+
+	if e.devStreak >= speedChangeStreak {
+		e.alpha = 0.15 // sustained boost: several dots in a row confirm a real speed change
 	} else {
 		e.alpha = e.baseAlpha
 	}
