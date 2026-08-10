@@ -45,7 +45,7 @@ $('lockFreqBtn').innerHTML = icons.target;
 const md = $('md');
 const state = {
   sq: 3, wpm: 20, auto: false, running: false,
-  ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true,
+  ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true, snrGate: false, snrGateDb: 8,
   theme: 'light', device: null, detected: 0, freqNow: 0,
 };
 const cfg = {
@@ -53,12 +53,13 @@ const cfg = {
   wpm: { min: 5, max: 50, step: 1 },
   fcenter: { min: 300, max: 1000, step: 10 },
   fbw: { min: 50, max: 600, step: 10 },
+  snrGateDb: { min: 0, max: 20, step: 1 },
 };
 
 function pushFilter() {
   call('SetFilter', {
     type: state.ftype, center: state.fcenter, bandwidth: state.fbw,
-    squelch: state.sq, noiseRed: state.nr,
+    squelch: state.sq, noiseRed: state.nr, snrGate: state.snrGate, snrGateDb: state.snrGateDb,
   });
   updateFreqWarn();
 }
@@ -166,6 +167,7 @@ function toggle(id, key) {
   });
 }
 toggle('nr', 'nr');
+toggle('snrgate', 'snrGate');
 
 // --- Popovers (filters + device picker share this) ---------------------------
 const toolbar = $('toolbar'), pop = $('popFilters'), filtBtn = $('filtBtn');

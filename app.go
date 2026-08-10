@@ -12,11 +12,13 @@ import (
 
 // FilterConfig mirrors the "Filters" dialog in the UI.
 type FilterConfig struct {
-	Type      string `json:"type"`      // "None" | "Bandpass" | "Narrow CW"
-	Center    int    `json:"center"`    // Hz
-	Bandwidth int    `json:"bandwidth"` // Hz
-	Squelch   int    `json:"squelch"`   // 0-9
-	NoiseRed  bool   `json:"noiseRed"`
+	Type      string  `json:"type"`      // "None" | "Bandpass" | "Narrow CW"
+	Center    int     `json:"center"`    // Hz
+	Bandwidth int     `json:"bandwidth"` // Hz
+	Squelch   int     `json:"squelch"`   // 0-9
+	NoiseRed  bool    `json:"noiseRed"`
+	SNRGate   bool    `json:"snrGate"`   // gate the Schmitt trigger on spectral SNR
+	SNRGateDb float64 `json:"snrGateDb"` // required peak-to-noise-floor ratio, in dB
 }
 
 // SpeedConfig mirrors the WPM control (with auto-detect).

@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -68,12 +69,14 @@ type Engine struct {
 	// except during initialisation (before the goroutine starts) or reset.
 	// bp is stored as a pointer so SetFilter can replace it with a single atomic
 	// write; nil means the filter type is "None" (passthrough).
-	bp      *dsp.BandpassChain
-	lp      *dsp.Biquad
-	schmitt *dsp.SchmittTrigger
-	est     *morse.SpeedEstimator
-	dec     *morse.Decoder
-	agcPeak float64
+	bp           *dsp.BandpassChain
+	lp           *dsp.Biquad
+	schmitt      *dsp.SchmittTrigger
+	est          *morse.SpeedEstimator
+	dec          *morse.Decoder
+	agcPeak      float64
+	snrGate      bool    // see FilterConfig.SNRGate
+	snrGateRatio float64 // linear peak/floor ratio, derived from FilterConfig.SNRGateDb
 
 	// WebSDR source state.
 	webSDRProxy *websdr.Proxy // non-nil while websdr source is active
@@ -104,7 +107,7 @@ func NewEngine(emit emitFunc) *Engine {
 	return &Engine{
 		emit:    emit,
 		srcKind: "mic",
-		filter:  FilterConfig{Type: "Bandpass", Center: 700, Bandwidth: 200, Squelch: 3, NoiseRed: true},
+		filter:  FilterConfig{Type: "Bandpass", Center: 700, Bandwidth: 200, Squelch: 3, NoiseRed: true, SNRGate: false, SNRGateDb: 8},
 		speed:   SpeedConfig{WPM: 20, Auto: false},
 	}
 }
@@ -278,6 +281,8 @@ func (e *Engine) SetFilter(cfg FilterConfig) {
 		chain := filterChain(cfg, e.liveSR)
 		e.bp = &chain
 		e.schmitt.High, e.schmitt.Low = schmittThresholds(cfg.Squelch)
+		e.snrGate = cfg.SNRGate
+		e.snrGateRatio = dbToRatio(cfg.SNRGateDb)
 	}
 }
 
@@ -331,6 +336,8 @@ func (e *Engine) initLiveDecoder(filter FilterConfig, speed SpeedConfig, sr int)
 	e.lp = dsp.NewLowpass(100.0, sr)
 	e.schmitt = dsp.NewSchmittTrigger()
 	e.schmitt.High, e.schmitt.Low = schmittThresholds(filter.Squelch)
+	e.snrGate = filter.SNRGate
+	e.snrGateRatio = dbToRatio(filter.SNRGateDb)
 	wpmHint := float64(speed.WPM)
 	e.est = morse.NewEstimator(wpmHint, speed.Auto || wpmHint == 0)
 	e.dec = &morse.Decoder{}
@@ -699,6 +706,18 @@ func (e *Engine) process(in []float32) {
 		}
 	}
 
+	// SNR gate (opt-in, see FilterConfig.SNRGate): the AGC/percentile
+	// normalisation above is self-referential — pure noise still fills its own
+	// 0..1 range and crosses the Schmitt thresholds just fine. Suppress the
+	// envelope for this buffer unless the spectral peak actually stands above
+	// the noise floor, so noise-only stretches can't produce tone pulses that
+	// feed the bootstrap/auto-WPM estimator.
+	if e.snrGate && !snrAboveFloor(mags, maxMag, e.snrGateRatio) {
+		for i := range normEnv {
+			normEnv[i] = 0
+		}
+	}
+
 	// Schmitt trigger → pulse events for this buffer.
 	events := e.schmitt.Process(normEnv)
 
@@ -886,6 +905,29 @@ func goertzelMag(samples []float32, freq, sr float64) float64 {
 		power = 0
 	}
 	return math.Sqrt(power) / float64(len(samples))
+}
+
+// dbToRatio converts an SNR-gate dB setting to a linear amplitude ratio.
+// Goertzel magnitudes are amplitude, not power, hence the /20 (not /10).
+func dbToRatio(db float64) float64 {
+	return math.Pow(10, db/20)
+}
+
+// snrAboveFloor reports whether mags' peak clears ratio times the median bin
+// magnitude — a coarse noise-floor estimate that's robust to a single
+// narrowband tone (or a few crackly noise bins) skewing a mean.
+func snrAboveFloor(mags []float64, peak, ratio float64) bool {
+	if peak <= 0 {
+		return false
+	}
+	sorted := make([]float64, len(mags))
+	copy(sorted, mags)
+	sort.Float64s(sorted)
+	floor := sorted[len(sorted)/2]
+	if floor < 1e-12 {
+		return true // near-silent band: nothing to gate against
+	}
+	return peak >= floor*ratio
 }
 
 // decodeFile runs the batch WAV decode pipeline in a goroutine.
