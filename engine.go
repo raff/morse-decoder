@@ -967,6 +967,39 @@ func (e *Engine) decodeFile(path string, filter FilterConfig, speed SpeedConfig)
 	envelope := dsp.ExtractEnvelope(filtered, wav.SampleRate)
 	normalized := dsp.NormalizeEnvelope(envelope)
 
+	// SNR gate (opt-in, see FilterConfig.SNRGate): same rationale as the
+	// live-capture gate in process() — mirror it here in framesPerBuffer
+	// windows so file playback gets the same noise suppression.
+	if filter.SNRGate {
+		const bins = 64
+		ratio := dbToRatio(filter.SNRGateDb)
+		mags := make([]float64, bins)
+		for start := 0; start < len(wav.Samples); start += framesPerBuffer {
+			end := start + framesPerBuffer
+			if end > len(wav.Samples) {
+				end = len(wav.Samples)
+			}
+			win := make([]float32, end-start)
+			for i, s := range wav.Samples[start:end] {
+				win[i] = float32(s)
+			}
+			var maxMag float64
+			for i := 0; i < bins; i++ {
+				f := specFmin + (float64(i)+0.5)/bins*(specFmax-specFmin)
+				m := goertzelMag(win, f, float64(wav.SampleRate))
+				mags[i] = m
+				if m > maxMag {
+					maxMag = m
+				}
+			}
+			if !snrAboveFloor(mags, maxMag, ratio) {
+				for i := start; i < end; i++ {
+					normalized[i] = 0
+				}
+			}
+		}
+	}
+
 	e.mu.Lock()
 	running = e.running
 	e.mu.Unlock()
