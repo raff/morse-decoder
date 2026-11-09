@@ -93,6 +93,7 @@ select { background: var(--panel); color: var(--tx); border: 1px solid var(--lin
 
 .pop { position: absolute; z-index: 60; background: var(--bg); border: 1px solid var(--line2); border-radius: 12px; padding: 14px; min-width: 270px; display: none; }
 .pop .head { margin: 0 0 12px; font-size: 13px; font-weight: 600; }
+.inactive { opacity: 0.4; pointer-events: none; }
 .frow { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
 
 input[type="url"] { width: 100%; background: var(--panel); color: var(--tx); border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; font-size: 13px; font-family: var(--font-mono); outline: none; }

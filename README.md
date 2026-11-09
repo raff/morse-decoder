@@ -91,8 +91,9 @@ With **Follow station** on (the default), the decoder finds whichever station
 is actively keying between 200 and 2000 Hz and retunes when another one takes
 over, as in a back-and-forth QSO. It stays on the current station while that
 station is sending, so only one is copied at a time. In auto mode each station
-keeps its own speed. Tuning by hand (dragging the spectrum, the centre stepper,
-or the lock button) turns following off.
+keeps its own speed. Dragging the spectrum or pressing the lock button turns
+following off. Type, Center, Bandwidth and Noise Reduction are disabled while
+following, because they only apply to the passband below.
 
 With following off, the decoder only listens within the passband:
 

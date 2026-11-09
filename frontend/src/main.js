@@ -46,7 +46,7 @@ const md = $('md');
 const state = {
   sq: 3, wpm: 20, auto: false, running: false,
   ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true, follow: true,
-  theme: 'light', device: null, detected: 0, freqNow: 0,
+  theme: 'light', device: null, detected: 0, freqNow: 0, stationNow: 0,
 };
 const cfg = {
   sq: { min: 0, max: 9, step: 1 },
@@ -61,6 +61,34 @@ function pushFilter() {
     squelch: state.sq, noiseRed: state.nr, follow: state.follow,
   });
   updateFreqWarn();
+  renderFilterControls();
+}
+
+// Mirrors the backend: with 'None' it listens to the whole band even when
+// following is off, so the passband settings only apply outside these cases.
+function listensEverywhere() { return state.follow || state.ftype === 'None'; }
+
+// The passband the decoder actually uses: each extra stage narrows it the way
+// a cascaded filter would. Must match detectorConfig in engine.go.
+function effectiveBw() {
+  const stages = (state.ftype === 'Narrow CW' ? 2 : 1) + (state.nr ? 1 : 0);
+  return state.fbw * Math.sqrt(Math.pow(2, 1 / stages) - 1);
+}
+
+function setInactive(el, off) {
+  el.classList.toggle('inactive', off);
+  el.title = off ? 'Not used while following a station' : '';
+  if (el.matches('button')) el.disabled = off;
+  el.querySelectorAll('button, select').forEach((c) => { c.disabled = off; });
+}
+
+function renderFilterControls() {
+  const row = (sel) => document.querySelector(sel).closest('.frow');
+  setInactive(row('#ftype'), state.follow);
+  setInactive(row('.step[data-key="fcenter"]'), listensEverywhere());
+  setInactive(row('.step[data-key="fbw"]'), listensEverywhere());
+  setInactive($('nr'), listensEverywhere());
+  summary();
 }
 
 // Flags a filter center that has drifted from the detected carrier (more
@@ -68,7 +96,7 @@ function pushFilter() {
 // enables the lock-to-detected button whenever there's something to lock to.
 function updateFreqWarn() {
   const active = state.running && state.freqNow > 0;
-  const diverged = active && !state.follow && state.ftype !== 'None' && Math.abs(state.freqNow - state.fcenter) > state.fbw / 2;
+  const diverged = active && !listensEverywhere() && Math.abs(state.freqNow - state.fcenter) > effectiveBw() / 2;
   $('freqRo').classList.toggle('warn', diverged);
   $('lockFreqBtn').disabled = !active;
 }
@@ -85,8 +113,10 @@ applyTheme('light');
 
 // --- Toolbar summary + WPM control ------------------------------------------
 function summary() {
-  $('filtSummary').textContent =
-    (state.ftype === 'None' ? 'None' : `${state.ftype} · ${state.fbw} Hz`) + ` · sq ${state.sq}`;
+  let mode = 'None';
+  if (state.follow) mode = 'Follow';
+  else if (state.ftype !== 'None') mode = `${state.ftype} · ${state.fbw} Hz`;
+  $('filtSummary').textContent = `${mode} · sq ${state.sq}`;
 }
 function renderWpm() {
   const v = $('wpmVal'), step = $('wpmStep');
@@ -142,17 +172,16 @@ document.querySelectorAll('.step').forEach((s) => {
   const k = s.dataset.key, c = cfg[k];
   const bump = (d) => {
     if (k === 'wpm' && state.auto) return;
-    if (k === 'fcenter') setFollow(false);
     state[k] = Math.max(c.min, Math.min(c.max, state[k] + d * c.step));
     s.querySelector('.sv').textContent = state[k];
     if (k === 'wpm') { renderWpm(); pushSpeed(); }
-    else { summary(); pushFilter(); }
+    else { summary(); pushFilter(); drawSpectrum(); }
   };
   s.querySelector('.dec').addEventListener('click', () => bump(-1));
   s.querySelector('.inc').addEventListener('click', () => bump(1));
 });
 
-$('ftype').addEventListener('change', function () { state.ftype = this.value; summary(); pushFilter(); });
+$('ftype').addEventListener('change', function () { state.ftype = this.value; summary(); pushFilter(); drawSpectrum(); });
 $('autoWpm').addEventListener('click', function () {
   state.auto = this.getAttribute('aria-pressed') !== 'true';
   this.setAttribute('aria-pressed', state.auto ? 'true' : 'false');
@@ -163,7 +192,7 @@ function toggle(id, key) {
     e.stopPropagation();
     const on = this.getAttribute('aria-pressed') !== 'true';
     this.setAttribute('aria-pressed', on ? 'true' : 'false');
-    state[key] = on; pushFilter();
+    state[key] = on; pushFilter(); drawSpectrum();
   });
 }
 toggle('nr', 'nr');
@@ -174,6 +203,7 @@ function setFollow(on) {
   state.follow = on;
   $('follow').setAttribute('aria-pressed', on ? 'true' : 'false');
 }
+renderFilterControls();
 
 // --- Popovers (filters + device picker share this) ---------------------------
 const toolbar = $('toolbar'), pop = $('popFilters'), filtBtn = $('filtBtn');
@@ -334,9 +364,11 @@ function drawSpectrum() {
   ctx.clearRect(0, 0, W, H);
   const acc = css('--acc'), dim = css('--tx3');
   const span = SPEC_FMAX - SPEC_FMIN;
-  if (state.ftype !== 'None') {
-    const x0 = ((state.fcenter - state.fbw / 2 - SPEC_FMIN) / span) * W;
-    const x1 = ((state.fcenter + state.fbw / 2 - SPEC_FMIN) / span) * W;
+  const everywhere = listensEverywhere();
+  if (!everywhere) {
+    const bw = effectiveBw();
+    const x0 = ((state.fcenter - bw / 2 - SPEC_FMIN) / span) * W;
+    const x1 = ((state.fcenter + bw / 2 - SPEC_FMIN) / span) * W;
     ctx.globalAlpha = 0.14; ctx.fillStyle = acc; ctx.fillRect(x0, 0, x1 - x0, H); ctx.globalAlpha = 1;
   }
   const n = latestBins.length || 1, bp = W / n;
@@ -347,8 +379,10 @@ function drawSpectrum() {
     ctx.fillRect(i * bp + 0.5, H - h, bp - 1, h);
   }
   ctx.globalAlpha = 1;
-  if (state.ftype !== 'None') {
-    const cx = ((state.fcenter - SPEC_FMIN) / span) * W;
+  // While following, the line marks the station; there's no passband to show.
+  const marker = everywhere ? (state.running ? state.stationNow : 0) : state.fcenter;
+  if (marker > 0) {
+    const cx = ((marker - SPEC_FMIN) / span) * W;
     ctx.strokeStyle = acc; ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke(); ctx.setLineDash([]);
   }
@@ -403,6 +437,7 @@ if (haveBackend) {
     $('meter').textContent = s.levelDb + ' dB';
     state.detected = s.wpm;
     state.freqNow = s.freq;
+    state.stationNow = s.station;
     // While following, the passband marker shows the station being decoded.
     if (state.follow && s.station > 0 && s.station !== state.fcenter) {
       state.fcenter = s.station;
