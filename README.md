@@ -88,7 +88,7 @@ have not been tested.
 ## Following stations
 
 With **Follow station** on (the default), the decoder finds whichever station
-is actively keying between 300 and 1100 Hz and retunes when another one takes
+is actively keying between 200 and 2000 Hz and retunes when another one takes
 over, as in a back-and-forth QSO. It stays on the current station while that
 station is sending, so only one is copied at a time. In auto mode each station
 keeps its own speed. Tuning by hand (dragging the spectrum, the centre stepper,
@@ -163,7 +163,7 @@ frontend/src/style.css   Theme (light/dark) and component styles
 | `done` | — | File decode finished; resets play button |
 | `error` | string | Capture/decode failure; resets to idle |
 
-`bins` map linearly across `SPEC_FMIN..SPEC_FMAX` (300–1100 Hz by default),
+`bins` map linearly across `SPEC_FMIN..SPEC_FMAX` (200–2000 Hz by default),
 matching the same constants in `engine.go` and `main.js`.
 
 ## DSP pipeline
@@ -172,7 +172,7 @@ Live capture and recordings share one streaming path, so changes in speed,
 level or station partway through are handled the same way in both:
 
 ```
-audio → resample to 4 kHz → 10 Hz-spaced spectrogram, 5 ms frames, window
+audio → resample to 8 kHz → 10 Hz-spaced spectrogram, 5 ms frames, window
 matched to the dot length → per-bin noise floor + per-frame wideband static
 correction → station detection and following → adaptive key-up/key-down
 decision → k-means speed lock + re-lock → per-pulse classify → ASCII

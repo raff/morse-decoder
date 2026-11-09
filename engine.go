@@ -17,8 +17,8 @@ import (
 const (
 	sampleRate      = 48000 // PortAudio / WAV default; WebSDR uses liveSampleRate
 	framesPerBuffer = 2048
-	specFmin        = 300.0
-	specFmax        = 1100.0
+	specFmin        = 200.0
+	specFmax        = 2000.0
 )
 
 type emitFunc func(event string, data interface{})
@@ -611,7 +611,7 @@ func (e *Engine) process(in []float32) {
 	rms := math.Sqrt(sum / float64(len(in)))
 	level := 20 * math.Log10(rms+1e-9)
 
-	const bins = 64
+	const bins = 144 // 12.5 Hz per bin across specFmin..specFmax
 	mags := make([]float64, bins)
 	var maxMag, peakFreq float64
 	for i := 0; i < bins; i++ {

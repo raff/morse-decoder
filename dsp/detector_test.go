@@ -154,3 +154,61 @@ func TestDetectorKeepsCurrentStationDuringOverlap(t *testing.T) {
 		t.Errorf("stations = %v, want to stay on the first", stations)
 	}
 }
+
+// Every pitch in the band must be followable, at the rates audio arrives in.
+func TestDetectorFollowsAcrossBand(t *testing.T) {
+	cfg := DetectorConfig{BandMinHz: 200, BandMaxHz: 2000, CenterHz: 700, WidthHz: 130, Follow: true, ThresholdDB: 6}
+	for _, sr := range []int{8000, 11025, 44100, 48000} {
+		for _, pitch := range []float64{250, 800, 1300, 1600, 1950} {
+			r := rand.New(rand.NewSource(int64(pitch)))
+			x := make([]float64, 8*sr)
+			for i := range x {
+				tm := float64(i) / float64(sr)
+				if math.Mod(tm, 0.1) < 0.05 {
+					x[i] = math.Sin(2 * math.Pi * pitch * tm)
+				}
+				x[i] += 0.1 * r.NormFloat64()
+			}
+			d := NewDetector(cfg, sr)
+			var stations []float64
+			tones := 0
+			lastTone := false
+			for len(x) > 0 {
+				n := min(2048, len(x))
+				for _, ev := range d.Process(x[:n]) {
+					if ev.NewStation {
+						stations = append(stations, ev.FreqHz)
+						continue
+					}
+					if ev.Pulse.IsTone && !lastTone {
+						tones++
+					}
+					lastTone = ev.Pulse.IsTone
+				}
+				x = x[n:]
+			}
+			if len(stations) != 1 || math.Abs(stations[0]-pitch) > 20 {
+				t.Errorf("sr=%d pitch=%.0f: stations = %v", sr, pitch, stations)
+			}
+			if tones < 60 || tones > 90 {
+				t.Errorf("sr=%d pitch=%.0f: %d tones, want about 70", sr, pitch, tones)
+			}
+		}
+	}
+}
+
+// A low sample rate can't carry the top of the band, which must not break it.
+func TestDetectorLowSampleRate(t *testing.T) {
+	cfg := DetectorConfig{BandMinHz: 200, BandMaxHz: 2000, CenterHz: 700, WidthHz: 130, Follow: true, ThresholdDB: 6}
+	d := NewDetector(cfg, 3000)
+	x := make([]float64, 3000*4)
+	for i := range x {
+		if math.Mod(float64(i)/3000, 0.1) < 0.05 {
+			x[i] = math.Sin(2 * math.Pi * 700 * float64(i) / 3000)
+		}
+	}
+	d.Process(x)
+	if hz := d.FreqHz(); math.Abs(hz-700) > 20 {
+		t.Errorf("followed %.0f Hz, want about 700", hz)
+	}
+}

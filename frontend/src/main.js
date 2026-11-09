@@ -1,8 +1,8 @@
 import './style.css';
 
 // Frequency band the spectrum bins map onto (keep in sync with engine.go).
-const SPEC_FMIN = 300;
-const SPEC_FMAX = 1100;
+const SPEC_FMIN = 200;
+const SPEC_FMAX = 2000;
 
 // --- Backend bridge (Wails injects window.go and window.runtime) -------------
 const App = window.go?.main?.App;
@@ -51,7 +51,7 @@ const state = {
 const cfg = {
   sq: { min: 0, max: 9, step: 1 },
   wpm: { min: 5, max: 50, step: 1 },
-  fcenter: { min: 300, max: 1000, step: 10 },
+  fcenter: { min: 200, max: 2000, step: 10 },
   fbw: { min: 50, max: 600, step: 10 },
 };
 

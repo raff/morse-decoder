@@ -8,10 +8,10 @@ import (
 // Internal processing rate and frame layout. Everything below this point is
 // independent of the input sample rate.
 const (
-	detRate   = 4000 // Hz, input is resampled to this
+	detRate   = 8000 // Hz, input is resampled to this
 	detHopMs  = 5.0  // one decision per hop
 	detBinHz  = 10.0 // spacing of the frequency bins
-	detMaxWin = 512  // samples at detRate, must be a power of two
+	detMaxWin = 1024 // samples at detRate, must be a power of two
 )
 
 // Noise tracking. noiseQ is the quantile each bin's noise estimate follows: a
@@ -59,6 +59,9 @@ const (
 	hysteresisDB = 3.0
 	debounceDots = 0.2 // runs shorter than this fraction of a dot are glitches
 )
+
+// maxBinOfRate is the highest bin frequency as a fraction of the internal rate.
+const maxBinOfRate = 0.45
 
 const (
 	defaultDotMs = 40.0
@@ -163,7 +166,9 @@ func NewDetector(cfg DetectorConfig, sampleRate int) *Detector {
 	}
 	d.frameSec = float64(d.hop) / rate
 
-	for f := cfg.BandMinHz; f <= cfg.BandMaxHz+1e-9; f += detBinHz {
+	// Low sample rates can't represent the top of the band.
+	top := math.Min(cfg.BandMaxHz, rate*maxBinOfRate)
+	for f := cfg.BandMinHz; f <= top+1e-9; f += detBinHz {
 		d.bins = append(d.bins, f)
 		d.coeffs = append(d.coeffs, 2*math.Cos(2*math.Pi*f/rate))
 	}
