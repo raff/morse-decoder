@@ -47,6 +47,13 @@ const (
 	driftBins      = 3    // retune this far without calling it a new station
 	driftMarginDB  = 0.5  // a neighbouring bin must be this much stronger to retune
 	sameBins       = 5    // re-acquiring this close is the same station
+
+	// Evidence a candidate is really keying, checked over the stored frames.
+	// Waiting for it costs nothing but delay, since acquiring replays them.
+	minKeyRuns    = 4     // separate key-down runs, excludes isolated bursts
+	minKeyRunSec  = 0.015 // shorter runs don't count
+	minPeakDB     = 10.5  // key-down level that stands clear of noise spikes
+	sustainedDuty = 0.25  // or this much of the time key-down, for weak stations
 )
 
 // Level tracking of the followed station.
@@ -392,7 +399,7 @@ func (d *Detector) updateStation() {
 
 	if !d.locked {
 		if d.candidate(best, acquireSec) {
-			d.acquire(d.refine(best, sameBins))
+			d.tryAcquire(d.refine(best, sameBins))
 		}
 		return
 	}
@@ -413,7 +420,7 @@ func (d *Detector) updateStation() {
 	// neighbour can't pull the decoder away mid-transmission.
 	far := best < d.bin-sameBins || best > d.bin+sameBins
 	if far && d.activity[d.bin] < acquireLevel && d.candidate(best, switchSec) {
-		d.acquire(d.refine(best, sameBins))
+		d.tryAcquire(d.refine(best, sameBins))
 		return
 	}
 	if !far {
@@ -458,6 +465,52 @@ func abs(x int) int {
 	return x
 }
 
+// tryAcquire follows bin if its recent history looks like keying, and otherwise
+// makes the candidate start over so it's checked again with more evidence.
+func (d *Detector) tryAcquire(bin int) {
+	if d.looksKeyed(bin) {
+		d.acquire(bin)
+	} else {
+		d.candCount = 0
+	}
+}
+
+// looksKeyed reports whether bin's stored frames show repeated key-down runs
+// that are either strong or sustained. Activity alone also rises for a single
+// burst, or for scattered noise spikes that happen to land on one bin.
+func (d *Detector) looksKeyed(bin int) bool {
+	level := d.keyLevel(bin)
+	threshold := math.Max(d.cfg.ThresholdDB, level-belowPeakOn)
+	minFrames := int(math.Ceil(minKeyRunSec / d.frameSec))
+	runs, on, cur := 0, 0, 0
+	for i := 0; i < d.histLen; i++ {
+		if d.histRhoDB(i, bin) > threshold {
+			cur++
+			on++
+			continue
+		}
+		if cur >= minFrames {
+			runs++
+		}
+		cur = 0
+	}
+	if cur >= minFrames {
+		runs++
+	}
+	duty := float64(on) / float64(d.histLen)
+	return runs >= minKeyRuns && (level >= minPeakDB || duty >= sustainedDuty)
+}
+
+// keyLevel estimates bin's key-down level as a high percentile of its history.
+func (d *Detector) keyLevel(bin int) float64 {
+	levels := make([]float64, 0, d.histLen)
+	for i := 0; i < d.histLen; i++ {
+		levels = append(levels, d.histRhoDB(i, bin))
+	}
+	sort.Float64s(levels)
+	return levels[len(levels)*98/100]
+}
+
 // acquire starts following bin and decodes the recent history, so the
 // characters sent while the station was being recognised aren't lost.
 func (d *Detector) acquire(bin int) {
@@ -473,12 +526,7 @@ func (d *Detector) acquire(bin int) {
 
 	// Start the level near the top of the history, which is the station's
 	// key-down level, so noise from before it appeared doesn't decode.
-	levels := make([]float64, 0, d.histLen)
-	for i := 0; i < d.histLen; i++ {
-		levels = append(levels, d.histRhoDB(i, bin))
-	}
-	sort.Float64s(levels)
-	d.levelDB = levels[len(levels)*98/100]
+	d.levelDB = d.keyLevel(bin)
 
 	// Replay from where the station first keys down, skipping the noise
 	// before it, which would otherwise train the speed estimate on junk. The

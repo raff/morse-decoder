@@ -366,6 +366,11 @@ Design points worth keeping if this is changed:
   while it's being recognised. Live output of a new station's first characters
   is delayed by that recognition time.
 
+- A candidate station must show at least 4 separate key-down runs, and be
+  either clearly above noise or key-down much of the time. Activity alone also
+  rises for one isolated burst or for scattered noise spikes on one bin. These
+  thresholds were set from a small set of recordings and may need adjusting.
+
 Follow mode locks onto whichever station was keying first. With two stations
 sending at once it stays on that one even if the other is the one wanted;
 tuning by hand is the way to choose.

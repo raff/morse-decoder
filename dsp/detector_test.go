@@ -212,3 +212,30 @@ func TestDetectorLowSampleRate(t *testing.T) {
 		t.Errorf("followed %.0f Hz, want about 700", hz)
 	}
 }
+
+// One isolated burst has plenty of energy but isn't keying.
+func TestDetectorIgnoresIsolatedBurst(t *testing.T) {
+	r := rand.New(rand.NewSource(11))
+	x := make([]float64, 12*detTestSR)
+	for i := 3 * detTestSR; i < 3*detTestSR+detTestSR/5; i++ {
+		x[i] = math.Sin(2 * math.Pi * 900 * float64(i) / detTestSR)
+	}
+	detAddNoise(x, 0.2, r)
+	if tones, stations := detRun(NewDetector(detCfg(true, 700), detTestSR), x); len(tones) != 0 || len(stations) != 0 {
+		t.Errorf("isolated burst gave tones=%v stations=%v", tones, stations)
+	}
+}
+
+// Waiting for evidence must not cost the start of the transmission.
+func TestDetectorKeepsStartOfTransmission(t *testing.T) {
+	x := append(make([]float64, 3*detTestSR), detKeyed(700, 1, 3)...)
+	x = append(x, make([]float64, detTestSR)...)
+	detAddNoise(x, 0.2, rand.New(rand.NewSource(12)))
+	tones, stations := detRun(NewDetector(detCfg(true, 700), detTestSR), x)
+	if len(stations) != 1 {
+		t.Fatalf("stations = %v", stations)
+	}
+	if len(tones) < 28 || len(tones) > 32 {
+		t.Errorf("got %d tones, want about 30", len(tones))
+	}
+}
