@@ -175,7 +175,7 @@ func (e *SpeedEstimator) Relock(recentTonesMs []float64) bool {
 // plausible dash/dot ratio.
 func DotFromTones(tonesMs []float64) (float64, bool) {
 	dot, dash := kmeans2(tonesMs, 0)
-	if dot <= 0 || dash/dot < relockMinRatio || dash/dot > relockMaxRatio {
+	if dot < minPlausibleDotMs || dash/dot < relockMinRatio || dash/dot > relockMaxRatio {
 		return 0, false
 	}
 	boundary := (dot + dash) / 2
@@ -191,6 +191,10 @@ func DotFromTones(tonesMs []float64) (float64, bool) {
 	}
 	return dot, true
 }
+
+// minPlausibleDotMs is the dot length at 50 WPM, the fastest speed supported.
+// A shorter "dot" cluster is noise blips, not an operator.
+const minPlausibleDotMs = 24.0
 
 const (
 	relockMinTones = 12

@@ -43,3 +43,23 @@ func TestUpdateBoostsOnSustainedSpeedChange(t *testing.T) {
 		t.Errorf("alpha = %.2f after sustained deviation, want boosted 0.15", e.alpha)
 	}
 }
+
+// Noise blips can look like a dot cluster, but not one faster than any operator.
+func TestDotFromTonesRejectsBlips(t *testing.T) {
+	if dot, ok := DotFromTones([]float64{20, 45, 45, 60, 10, 90, 60, 15, 25}); ok {
+		t.Errorf("accepted blips as dots of %.1f ms", dot)
+	}
+	dot, ok := DotFromTones([]float64{55, 165, 60, 170, 50, 160, 58, 55, 165})
+	if !ok || dot < 50 || dot > 60 {
+		t.Errorf("real tones: dot=%.1f ok=%v", dot, ok)
+	}
+}
+
+func TestRelockIgnoresBlips(t *testing.T) {
+	e := NewEstimator(22, true)
+	e.Seed(55)
+	tones := []float64{20, 45, 45, 60, 10, 90, 60, 15, 25, 20, 50, 15, 80, 12, 60, 18}
+	if e.Relock(tones) {
+		t.Errorf("relocked to %.1f ms on noise blips", e.DotMs)
+	}
+}
