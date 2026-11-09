@@ -97,8 +97,10 @@ func (e *SpeedEstimator) BootstrapGaps(silenceDurationsMs []float64) {
 		return
 	}
 
-	// Only trust the split if the two clusters are meaningfully distinct.
-	if c2/c1 < 1.8 {
+	// Only trust the split if the two clusters look like character and word
+	// gaps (7:3 in standard timing). A much larger c2 is idle time between
+	// transmissions, which says nothing about the boundary.
+	if c2/c1 < 1.8 || c2/c1 > 3.5 {
 		return
 	}
 
@@ -140,6 +142,62 @@ func (e *SpeedEstimator) Bootstrap(toneDurationsMs []float64) {
 	}
 	e.bootstrapped = true
 }
+
+// Seed marks the estimator as locked at a known dot length, for resuming a
+// station whose speed has already been measured.
+func (e *SpeedEstimator) Seed(dotMs float64) {
+	e.DotMs = dotMs
+	e.bootstrapped = true
+}
+
+// Relock corrects an estimate that has fallen out of step with the signal. The
+// per-pulse EMA can't do this on its own: once DotMs is far too short every
+// real element classifies as a dash, and only dots feed the EMA. Recent tones
+// must split into two populated clusters with a plausible dash/dot ratio, so
+// a run of noise can't trigger it. Reports whether the estimate changed.
+func (e *SpeedEstimator) Relock(recentTonesMs []float64) bool {
+	if !e.adaptive || len(recentTonesMs) < relockMinTones {
+		return false
+	}
+	dot, ok := DotFromTones(recentTonesMs)
+	if !ok || math.Abs(dot-e.DotMs)/e.DotMs < relockMinError {
+		return false
+	}
+	e.DotMs = dot
+	e.Farnsworth = false
+	e.charGapThreshMs, e.wordGapThreshMs = 0, 0
+	e.devDir, e.devStreak = 0, 0
+	return true
+}
+
+// DotFromTones finds the dot length in a run of tone durations, and reports
+// whether they really look like Morse: two populated clusters with a
+// plausible dash/dot ratio.
+func DotFromTones(tonesMs []float64) (float64, bool) {
+	dot, dash := kmeans2(tonesMs, 0)
+	if dot <= 0 || dash/dot < relockMinRatio || dash/dot > relockMaxRatio {
+		return 0, false
+	}
+	boundary := (dot + dash) / 2
+	dots := 0
+	for _, ms := range tonesMs {
+		if ms < boundary {
+			dots++
+		}
+	}
+	minCount := len(tonesMs) / 6
+	if dots < minCount || len(tonesMs)-dots < minCount {
+		return 0, false
+	}
+	return dot, true
+}
+
+const (
+	relockMinTones = 12
+	relockMinRatio = 2.0
+	relockMaxRatio = 4.5
+	relockMinError = 0.35 // relative; smaller errors are left to the EMA
+)
 
 // speedChangeStreak is how many consecutive dots must deviate from DotMs in
 // the same direction before update() treats it as a genuine speed change

@@ -2,7 +2,6 @@ package main
 
 import (
 	"math"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +35,8 @@ type DecodedChunk struct {
 }
 
 type Status struct {
-	Freq    int `json:"freq"`    // detected tone frequency, Hz
+	Freq    int `json:"freq"`    // followed station if any, else strongest tone, Hz
+	Station int `json:"station"` // followed station, Hz; 0 when no station is present
 	WPM     int `json:"wpm"`     // detected / effective speed
 	LevelDB int `json:"levelDb"` // input level
 }
@@ -60,23 +60,20 @@ type Engine struct {
 	srcKind      string // "mic" or "file"
 	filePath     string
 
-	filter     FilterConfig
-	speed      SpeedConfig
-	wantClear  bool
-	speedDirty bool // set by SetSpeed; applied by process() to avoid racing e.est
+	filter      FilterConfig
+	speed       SpeedConfig
+	wantClear   bool
+	speedDirty  bool // set by SetSpeed; applied by process() to avoid racing e.est
+	filterDirty bool // set by SetFilter; applied by process() to avoid racing e.det
 
-	// Live DSP state — owned by the capture goroutine; never touched under mu
+	// Live DSP state — owned by the decoding goroutine; never touched under mu
 	// except during initialisation (before the goroutine starts) or reset.
-	// bp is stored as a pointer so SetFilter can replace it with a single atomic
-	// write; nil means the filter type is "None" (passthrough).
-	bp           *dsp.BandpassChain
-	lp           *dsp.Biquad
-	schmitt      *dsp.SchmittTrigger
-	est          *morse.SpeedEstimator
-	dec          *morse.Decoder
-	agcPeak      float64
-	snrGate      bool    // see FilterConfig.SNRGate
-	snrGateRatio float64 // linear peak/floor ratio, derived from FilterConfig.SNRGateDb
+	det *dsp.Detector
+	est *morse.SpeedEstimator
+	dec *morse.Decoder
+
+	stationHz  float64             // station currently being decoded
+	stationDot map[float64]float64 // last known dot length of each station heard
 
 	// WebSDR source state.
 	webSDRProxy *websdr.Proxy // non-nil while websdr source is active
@@ -95,6 +92,11 @@ type Engine struct {
 	silDurMs     []float64
 	toneDurSumMs float64 // running sum of toneDurMs, kept for O(1) amortised trimming
 	silDurSumMs  float64 // running sum of silDurMs
+	tonesSeen    int     // tones since the estimator was created, paces re-lock checks
+
+	// Pulses waiting for the speed estimator's first lock, so the start of a
+	// transmission is decoded rather than discarded.
+	preBoot []pulse
 
 	// Tracks how much of dec.Flush()'s output has already been emitted so the
 	// frontend (which appends chunks) never receives duplicate text.
@@ -107,7 +109,7 @@ func NewEngine(emit emitFunc) *Engine {
 	return &Engine{
 		emit:    emit,
 		srcKind: "mic",
-		filter:  FilterConfig{Type: "Bandpass", Center: 700, Bandwidth: 200, Squelch: 3, NoiseRed: true, SNRGate: false, SNRGateDb: 8},
+		filter:  FilterConfig{Type: "Bandpass", Center: 700, Bandwidth: 200, Squelch: 3, NoiseRed: true, Follow: true},
 		speed:   SpeedConfig{WPM: 20, Auto: false},
 	}
 }
@@ -274,24 +276,14 @@ func (e *Engine) SetFilter(cfg FilterConfig) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.filter = cfg
-	// Rebuild the filter chain if the live pipeline is active. The capture
-	// goroutine picks up the new pointer on its next buffer (pointer write is
-	// atomic on 64-bit; the old chain is simply abandoned).
-	if e.lp != nil {
-		chain := filterChain(cfg, e.liveSR)
-		e.bp = &chain
-		e.schmitt.High, e.schmitt.Low = schmittThresholds(cfg.Squelch)
-		e.snrGate = cfg.SNRGate
-		e.snrGateRatio = dbToRatio(cfg.SNRGateDb)
-	}
+	e.filterDirty = true
 }
 
-// filterChain builds a BandpassChain appropriate for the filter config.
-// Returns an empty chain (passthrough) when Type is "None".
-func filterChain(cfg FilterConfig, sr int) dsp.BandpassChain {
-	if cfg.Type == "None" {
-		return dsp.BandpassChain{}
-	}
+// detectorConfig maps the user-facing filter settings onto the detector. The
+// filter type and noise reduction keep their meaning as a narrower or wider
+// passband, using the bandwidth of the equivalent cascaded filter.
+func detectorConfig(cfg FilterConfig) dsp.DetectorConfig {
+	width := float64(cfg.Bandwidth)
 	stages := 1
 	if cfg.Type == "Narrow CW" {
 		stages = 2
@@ -299,17 +291,21 @@ func filterChain(cfg FilterConfig, sr int) dsp.BandpassChain {
 	if cfg.NoiseRed {
 		stages++
 	}
-	return dsp.NewBandpassChain(float64(cfg.Center), float64(cfg.Bandwidth), sr, stages)
+	width *= math.Sqrt(math.Pow(2, 1/float64(stages)) - 1)
+	return dsp.DetectorConfig{
+		BandMinHz:   specFmin,
+		BandMaxHz:   specFmax,
+		CenterHz:    float64(cfg.Center),
+		WidthHz:     width,
+		Follow:      cfg.Follow || cfg.Type == "None" || cfg.Center <= 0,
+		ThresholdDB: squelchDB(cfg.Squelch),
+	}
 }
 
-// schmittThresholds maps the squelch knob (0–9) to Schmitt trigger levels.
-// squelch=0 is most sensitive (triggers on faint signals),
-// squelch=9 requires a strong signal.
-func schmittThresholds(squelch int) (high, low float64) {
-	frac := float64(squelch) / 9.0
-	high = 0.25 + frac*0.55 // 0.25 → 0.80
-	low = high * 0.58       // ~same hysteresis ratio as original defaults
-	return
+// squelchDB maps the squelch knob (0-9) to the minimum tone-to-noise ratio
+// counted as key-down. 0 is most sensitive.
+func squelchDB(squelch int) float64 {
+	return 4 + float64(squelch)*2.0/3.0
 }
 
 func (e *Engine) SetSpeed(cfg SpeedConfig) {
@@ -331,17 +327,14 @@ func (e *Engine) Clear() {
 // process() after reading wantClear (no lock needed there).
 func (e *Engine) initLiveDecoder(filter FilterConfig, speed SpeedConfig, sr int) {
 	e.liveSR = sr
-	chain := filterChain(filter, sr)
-	e.bp = &chain
-	e.lp = dsp.NewLowpass(100.0, sr)
-	e.schmitt = dsp.NewSchmittTrigger()
-	e.schmitt.High, e.schmitt.Low = schmittThresholds(filter.Squelch)
-	e.snrGate = filter.SNRGate
-	e.snrGateRatio = dbToRatio(filter.SNRGateDb)
+	e.det = dsp.NewDetector(detectorConfig(filter), sr)
 	wpmHint := float64(speed.WPM)
 	e.est = morse.NewEstimator(wpmHint, speed.Auto || wpmHint == 0)
 	e.dec = &morse.Decoder{}
-	e.agcPeak = 1e-6
+	e.stationHz = 0
+	e.stationDot = make(map[float64]float64)
+	e.preBoot = nil
+	e.tonesSeen = 0
 	e.liveIsTone = false
 	e.liveMS = 0
 	e.charGapPeeked = false
@@ -608,37 +601,8 @@ func (e *Engine) captureWebSDR(proxy *websdr.Proxy, stopCh <-chan struct{}) {
 	}
 }
 
-// process turns one buffer of samples into UI updates.
+// process turns one buffer of live samples into UI updates.
 func (e *Engine) process(in []float32) {
-	// Handle deferred Clear() requests.
-	e.mu.Lock()
-	if e.wantClear {
-		filter := e.filter
-		speed := e.speed
-		sr := e.liveSR
-		e.wantClear = false
-		e.speedDirty = false
-		e.mu.Unlock()
-		e.initLiveDecoder(filter, speed, sr)
-	} else if e.speedDirty {
-		speed := e.speed
-		e.speedDirty = false
-		e.mu.Unlock()
-		// Rebuild the estimator with the new auto/manual setting.
-		// When switching to auto, seed from the current dot-length so the
-		// estimate doesn't reset; when switching to manual, use the configured WPM.
-		adaptive := speed.Auto || speed.WPM == 0
-		var wpmHint float64
-		if adaptive && e.est != nil && e.est.IsBootstrapped() && e.est.DotMs > 0 {
-			wpmHint = 1200.0 / e.est.DotMs
-		} else {
-			wpmHint = float64(speed.WPM)
-		}
-		e.est = morse.NewEstimator(wpmHint, adaptive)
-	} else {
-		e.mu.Unlock()
-	}
-
 	// ── Level and spectrum (Goertzel filterbank for the display) ────────────
 	var sum float64
 	for _, x := range in {
@@ -665,83 +629,49 @@ func (e *Engine) process(in []float32) {
 		}
 	}
 	e.emit("spectrum", SpectrumFrame{Bins: normSpec})
-	e.emit("status", Status{Freq: int(peakFreq), WPM: e.currentWPM(), LevelDB: int(level)})
+	e.decodeBuffer(in)
+	e.emitStatus(peakFreq, level)
+}
 
-	// ── DSP decode pipeline ──────────────────────────────────────────────────
-	// Convert to float64 and optionally apply bandpass filter around the carrier.
+// emitStatus reports the followed station, falling back to peakHz when no
+// station is present.
+func (e *Engine) emitStatus(peakHz, level float64) {
+	station := int(e.det.FreqHz())
+	freq := station
+	if freq == 0 {
+		freq = int(peakHz)
+	}
+	e.emit("status", Status{Freq: freq, Station: station, WPM: e.currentWPM(), LevelDB: int(level)})
+}
+
+// decodeBuffer runs one buffer through the decoder, shared by every source.
+func (e *Engine) decodeBuffer(in []float32) {
+	e.applyPendingConfig()
+
 	f64 := make([]float64, len(in))
 	for i, x := range in {
 		f64[i] = float64(x)
 	}
-	var filtered []float64
-	if bp := e.bp; bp != nil {
-		filtered = bp.Apply(f64)
-	} else {
-		filtered = f64
-	}
-
-	// Rectify + lowpass to extract amplitude envelope.
-	for i, s := range filtered {
-		f64[i] = math.Abs(s)
-	}
-	env := e.lp.Apply(f64)
-
-	// Running AGC: track peak with slow exponential decay (~2 s time constant at 48 kHz).
-	// decay = exp(-1 / (sampleRate * τ)) = exp(-1 / (48000 * 2)) ≈ 0.999990
-	for _, v := range env {
-		if v > e.agcPeak {
-			e.agcPeak = v
-		} else {
-			e.agcPeak *= 0.999990
-		}
-	}
-	normEnv := make([]float64, len(env))
-	if e.agcPeak > 1e-9 {
-		for i, v := range env {
-			n := v / e.agcPeak
-			if n > 1.0 {
-				n = 1.0
-			}
-			normEnv[i] = n
-		}
-	}
-
-	// SNR gate (opt-in, see FilterConfig.SNRGate): the AGC/percentile
-	// normalisation above is self-referential — pure noise still fills its own
-	// 0..1 range and crosses the Schmitt thresholds just fine. Suppress the
-	// envelope for this buffer unless the spectral peak actually stands above
-	// the noise floor, so noise-only stretches can't produce tone pulses that
-	// feed the bootstrap/auto-WPM estimator.
-	if e.snrGate && !snrAboveFloor(mags, maxMag, e.snrGateRatio) {
-		for i := range normEnv {
-			normEnv[i] = 0
-		}
-	}
-
-	// Schmitt trigger → pulse events for this buffer.
-	events := e.schmitt.Process(normEnv)
 
 	// Merge pulse events across buffer boundaries and decode completed pulses.
-	for _, evt := range events {
-		ms := float64(evt.DurationSamples) / float64(e.liveSR) * 1000.0
-		if e.liveMS > 0 && evt.IsTone == e.liveIsTone {
-			// Same polarity as the pending pulse — it was split at the buffer
-			// edge. SchmittTrigger.count only resets on a real tone/silence
-			// transition, so evt.DurationSamples already IS the cumulative
-			// duration since the pulse started (across however many prior
-			// buffers), not just this buffer's slice of it. Replacing (not
-			// adding) is what keeps this correct; adding double/triple-counts
-			// every pulse that spans more than one buffer — silently but
-			// severely, since buffers are ~43ms and most dashes/gaps exceed that.
+	for _, evt := range e.det.Process(f64) {
+		if evt.NewStation {
+			e.startStation(evt.FreqHz)
+			continue
+		}
+		ms := float64(evt.Pulse.DurationSamples) / float64(e.liveSR) * 1000.0
+		if e.liveMS > 0 && evt.Pulse.IsTone == e.liveIsTone {
+			// Same polarity as the pending pulse: the detector reports the run
+			// in progress cumulatively, so this replaces the pending duration.
 			e.liveMS = ms
 			continue
 		}
 		if e.liveMS > 0 {
 			e.decodePulse(e.liveIsTone, e.liveMS)
 		}
-		e.liveIsTone = evt.IsTone
+		e.liveIsTone = evt.Pulse.IsTone
 		e.liveMS = ms
-		if evt.IsTone {
+		if evt.Pulse.IsTone {
 			e.charGapPeeked = false
 			e.wordGapPeeked = false
 		}
@@ -778,7 +708,102 @@ func (e *Engine) process(in []float32) {
 			e.emitDecoded()
 		}
 	}
+	e.syncDetectorSpeed()
 }
+
+// syncDetectorSpeed matches the detector to the speed in use, or to its
+// default while the speed is still unknown.
+func (e *Engine) syncDetectorSpeed() {
+	if e.est.IsBootstrapped() {
+		e.det.SetDotMs(e.est.DotMs)
+	} else {
+		e.det.SetDotMs(0)
+	}
+}
+
+// applyPendingConfig handles requests made from other goroutines, which are
+// deferred to here so they can't race the decoding state.
+func (e *Engine) applyPendingConfig() {
+	e.mu.Lock()
+	if e.filterDirty {
+		e.filterDirty = false
+		e.det.Configure(detectorConfig(e.filter))
+	}
+	if e.wantClear {
+		filter := e.filter
+		speed := e.speed
+		sr := e.liveSR
+		e.wantClear = false
+		e.speedDirty = false
+		e.mu.Unlock()
+		e.initLiveDecoder(filter, speed, sr)
+		return
+	}
+	if e.speedDirty {
+		speed := e.speed
+		e.speedDirty = false
+		e.mu.Unlock()
+		// Rebuild the estimator with the new auto/manual setting.
+		// When switching to auto, seed from the current dot-length so the
+		// estimate doesn't reset; when switching to manual, use the configured WPM.
+		adaptive := speed.Auto || speed.WPM == 0
+		var wpmHint float64
+		if adaptive && e.est != nil && e.est.IsBootstrapped() && e.est.DotMs > 0 {
+			wpmHint = 1200.0 / e.est.DotMs
+		} else {
+			wpmHint = float64(speed.WPM)
+		}
+		e.est = morse.NewEstimator(wpmHint, adaptive)
+		e.preBoot = nil
+		e.tonesSeen = 0
+		e.syncDetectorSpeed()
+		return
+	}
+	e.mu.Unlock()
+}
+
+// startStation finishes what was being decoded and switches timing to the
+// station now on the air. Stations often differ in speed, so in auto mode a
+// returning station resumes at its last known speed and a new one starts
+// over. A manually set speed is left alone.
+func (e *Engine) startStation(hz float64) {
+	if e.liveMS > 0 {
+		e.decodePulse(e.liveIsTone, e.liveMS)
+		e.liveMS = 0
+	}
+	e.charGapPeeked = false
+	e.wordGapPeeked = false
+
+	if e.stationHz > 0 && e.est.IsBootstrapped() {
+		e.stationDot[e.stationHz] = e.est.DotMs
+	}
+	e.stationHz = hz
+	e.dec.Feed(morse.Symbol{Type: morse.SymWordGap})
+	e.morseSyms.WriteString(morse.SymWordGap.String())
+	e.emitDecoded()
+
+	e.mu.Lock()
+	speed := e.speed
+	e.mu.Unlock()
+	if !speed.Auto && speed.WPM != 0 {
+		return
+	}
+	e.est = morse.NewEstimator(float64(speed.WPM), true)
+	e.toneDurMs, e.toneDurSumMs = nil, 0
+	e.silDurMs, e.silDurSumMs = nil, 0
+	e.preBoot = nil
+	e.tonesSeen = 0
+	for known, dot := range e.stationDot {
+		if math.Abs(known-hz) <= stationMatchHz {
+			e.est.Seed(dot)
+			break
+		}
+	}
+}
+
+// stationMatchHz is how close a frequency must be to count as a station heard
+// before: it allows for tuning drift but not for a different signal.
+const stationMatchHz = 30.0
 
 // maxAutoWPM/minAutoWPM bound auto speed detection to the same range the
 // manual WPM slider allows. Outside of it is almost certainly noise
@@ -818,11 +843,13 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 		e.silDurMs = appendDur(e.silDurMs, &e.silDurSumMs, ms)
 	}
 
-	// Bootstrap speed estimator once enough tone samples are available.
+	// Hold pulses until the first speed lock, then decode them all.
 	if !e.est.IsBootstrapped() {
-		if len(e.toneDurMs) >= 8 {
+		e.preBoot = append(e.preBoot, pulse{isTone, ms})
+		if e.bootstrapReady() {
 			e.est.Bootstrap(e.toneDurMs)
 			clampDotMs(e.est)
+			e.drainPreBoot()
 		}
 		return
 	}
@@ -832,18 +859,67 @@ func (e *Engine) decodePulse(isTone bool, ms float64) {
 		e.est.BootstrapGaps(e.silDurMs)
 	}
 
+	if isTone {
+		e.tonesSeen++
+		if e.tonesSeen%relockEvery == 0 {
+			recent := e.toneDurMs[max(0, len(e.toneDurMs)-relockWindow):]
+			if e.est.Relock(recent) {
+				clampDotMs(e.est)
+			}
+		}
+	}
+
+	e.classify(isTone, ms)
+}
+
+// bootstrapReady holds the first speed lock until the tones look like real
+// dots and dashes, giving up on that after maxBootstrapTones so that unusual
+// sending still decodes. Nothing is lost waiting, since pulses are held.
+func (e *Engine) bootstrapReady() bool {
+	if len(e.toneDurMs) < 8 {
+		return false
+	}
+	_, plausible := morse.DotFromTones(e.toneDurMs)
+	return plausible || len(e.toneDurMs) >= maxBootstrapTones
+}
+
+const maxBootstrapTones = 24
+
+// How often auto mode checks its speed against the last relockWindow tones.
+const (
+	relockEvery  = 8
+	relockWindow = 24
+)
+
+// classify turns one accepted pulse into a symbol and feeds the decoder.
+func (e *Engine) classify(isTone bool, ms float64) {
 	sym := e.est.Classify(isTone, ms)
 	clampDotMs(e.est) // keep WPM ≤ maxAutoWPM after any adaptive update
 
 	e.morseSyms.WriteString(sym.Type.String())
 	e.dec.Feed(sym)
 
-	// Emit on every character or word boundary. The peek in process() may have
+	// Emit on every character or word boundary. The peek in decodeBuffer may have
 	// already fed this char gap and updated lastEmitLen, in which case emitDecoded
 	// finds no new text but may still flush a pending morse separator.
 	if sym.Type == morse.SymCharGap || sym.Type == morse.SymWordGap {
 		e.emitDecoded()
 	}
+}
+
+// drainPreBoot decodes the pulses held back before the first speed lock.
+func (e *Engine) drainPreBoot() {
+	held := e.preBoot
+	e.preBoot = nil
+	for _, p := range held {
+		e.classify(p.isTone, p.ms)
+	}
+}
+
+// pulse is one tone or silence with its duration.
+type pulse struct {
+	isTone bool
+	ms     float64
 }
 
 // durationWindowMs bounds toneDurMs/silDurMs by cumulative duration rather
@@ -907,30 +983,9 @@ func goertzelMag(samples []float32, freq, sr float64) float64 {
 	return math.Sqrt(power) / float64(len(samples))
 }
 
-// dbToRatio converts an SNR-gate dB setting to a linear amplitude ratio.
-// Goertzel magnitudes are amplitude, not power, hence the /20 (not /10).
-func dbToRatio(db float64) float64 {
-	return math.Pow(10, db/20)
-}
-
-// snrAboveFloor reports whether mags' peak clears ratio times the median bin
-// magnitude — a coarse noise-floor estimate that's robust to a single
-// narrowband tone (or a few crackly noise bins) skewing a mean.
-func snrAboveFloor(mags []float64, peak, ratio float64) bool {
-	if peak <= 0 {
-		return false
-	}
-	sorted := make([]float64, len(mags))
-	copy(sorted, mags)
-	sort.Float64s(sorted)
-	floor := sorted[len(sorted)/2]
-	if floor < 1e-12 {
-		return true // near-silent band: nothing to gate against
-	}
-	return peak >= floor*ratio
-}
-
-// decodeFile runs the batch WAV decode pipeline in a goroutine.
+// decodeFile decodes a recording through the same adaptive path as live
+// capture, so speed, level and station changes partway through a recording are
+// handled instead of being averaged over the whole file.
 func (e *Engine) decodeFile(path string, filter FilterConfig, speed SpeedConfig) {
 	defer e.wg.Done()
 	defer e.emit("done", nil)
@@ -946,136 +1001,46 @@ func (e *Engine) decodeFile(path string, filter FilterConfig, speed SpeedConfig)
 		return
 	}
 
-	centerHz := float64(filter.Center)
-	if centerHz <= 0 {
-		centerHz = dsp.DetectCarrier(wav.Samples, wav.SampleRate, 400, 2000)
-	}
-
 	e.mu.Lock()
-	running := e.running
+	e.initLiveDecoder(filter, speed, wav.SampleRate)
 	e.mu.Unlock()
-	if !running {
-		return
-	}
 
-	// Build the filter chain with the (possibly auto-detected) centre frequency.
-	chainCfg := filter
-	chainCfg.Center = int(centerHz)
-	bp := filterChain(chainCfg, wav.SampleRate)
-	filtered := bp.Apply(wav.Samples)
-
-	envelope := dsp.ExtractEnvelope(filtered, wav.SampleRate)
-	normalized := dsp.NormalizeEnvelope(envelope)
-
-	// SNR gate (opt-in, see FilterConfig.SNRGate): same rationale as the
-	// live-capture gate in process() — mirror it here in framesPerBuffer
-	// windows so file playback gets the same noise suppression.
-	if filter.SNRGate {
-		const bins = 64
-		ratio := dbToRatio(filter.SNRGateDb)
-		mags := make([]float64, bins)
-		for start := 0; start < len(wav.Samples); start += framesPerBuffer {
-			end := start + framesPerBuffer
-			if end > len(wav.Samples) {
-				end = len(wav.Samples)
-			}
-			win := make([]float32, end-start)
-			for i, s := range wav.Samples[start:end] {
-				win[i] = float32(s)
-			}
-			var maxMag float64
-			for i := 0; i < bins; i++ {
-				f := specFmin + (float64(i)+0.5)/bins*(specFmax-specFmin)
-				m := goertzelMag(win, f, float64(wav.SampleRate))
-				mags[i] = m
-				if m > maxMag {
-					maxMag = m
-				}
-			}
-			if !snrAboveFloor(mags, maxMag, ratio) {
-				for i := start; i < end; i++ {
-					normalized[i] = 0
-				}
-			}
+	// Status updates once per second of audio are plenty for a batch decode.
+	statusEvery := wav.SampleRate / framesPerBuffer
+	buf := make([]float32, framesPerBuffer)
+	for start, n := 0, 0; start < len(wav.Samples); start, n = start+framesPerBuffer, n+1 {
+		e.mu.Lock()
+		running := e.running
+		e.mu.Unlock()
+		if !running {
+			return
+		}
+		end := min(start+framesPerBuffer, len(wav.Samples))
+		chunk := buf[:end-start]
+		for i, s := range wav.Samples[start:end] {
+			chunk[i] = float32(s)
+		}
+		e.decodeBuffer(chunk)
+		if statusEvery > 0 && n%statusEvery == 0 {
+			e.emitStatus(float64(filter.Center), 0)
 		}
 	}
 
-	e.mu.Lock()
-	running = e.running
-	e.mu.Unlock()
-	if !running {
-		return
+	if e.liveMS > 0 {
+		e.decodePulse(e.liveIsTone, e.liveMS)
+		e.liveMS = 0
 	}
-
-	schmitt := dsp.NewSchmittTrigger()
-	schmitt.High, schmitt.Low = schmittThresholds(filter.Squelch)
-	events := schmitt.Process(normalized)
-	minSamples := int(10.0 / 1000.0 * float64(wav.SampleRate))
-	events = dsp.FilterShortPulses(events, minSamples)
-
-	type pulse struct {
-		isTone bool
-		ms     float64
-	}
-	pulses := make([]pulse, len(events))
-	var toneDurMs, silDurMs []float64
-	for i, ev := range events {
-		ms := float64(ev.DurationSamples) / float64(wav.SampleRate) * 1000.0
-		pulses[i] = pulse{ev.IsTone, ms}
-		if ev.IsTone {
-			toneDurMs = append(toneDurMs, ms)
-		} else {
-			silDurMs = append(silDurMs, ms)
+	// A short recording may end before the speed lock: decode what's held
+	// using the configured speed, if there is one.
+	if !e.est.IsBootstrapped() {
+		e.est.Bootstrap(e.toneDurMs)
+		clampDotMs(e.est)
+		if !e.est.IsBootstrapped() {
+			e.emit("error", "could not estimate WPM — try setting a manual WPM")
+			return
 		}
+		e.drainPreBoot()
 	}
-
-	wpmHint := float64(speed.WPM)
-	est := morse.NewEstimator(wpmHint, speed.Auto || wpmHint == 0)
-	if !est.IsBootstrapped() {
-		est.Bootstrap(toneDurMs)
-	}
-	if !est.IsBootstrapped() {
-		e.emit("error", "could not estimate WPM — try setting a manual WPM")
-		return
-	}
-	est.BootstrapGaps(silDurMs)
-
-	// Signal that decoding is underway: show the detected carrier and initial WPM.
-	e.emit("status", Status{Freq: int(centerHz), WPM: int(est.CurrentWPM()), LevelDB: 0})
-
-	// Decode pulse-by-pulse and emit text word-by-word so the display updates
-	// progressively rather than all at once at the end.
-	dec := &morse.Decoder{}
-	var morseSyms strings.Builder
-	var lastTextLen, lastMorseLen int
-
-	emitChunk := func() {
-		full := dec.Flush()
-		morse := morseSyms.String()
-		text := ""
-		morseChunk := ""
-		if len(full) > lastTextLen {
-			text = full[lastTextLen:]
-			lastTextLen = len(full)
-		}
-		if len(morse) > lastMorseLen {
-			morseChunk = morse[lastMorseLen:]
-			lastMorseLen = len(morse)
-		}
-		if text != "" || morseChunk != "" {
-			e.emit("decoded", DecodedChunk{Text: text, Morse: morseChunk})
-		}
-	}
-
-	for _, p := range pulses {
-		sym := est.Classify(p.isTone, p.ms)
-		morseSyms.WriteString(sym.Type.String())
-		dec.Feed(sym)
-		if sym.Type == morse.SymWordGap {
-			emitChunk()
-		}
-	}
-	emitChunk() // flush any trailing partial word
-
-	e.emit("status", Status{Freq: int(centerHz), WPM: int(est.CurrentWPM()), LevelDB: 0})
+	e.emitDecoded()
+	e.emitStatus(float64(filter.Center), 0)
 }

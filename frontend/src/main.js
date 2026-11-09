@@ -45,7 +45,7 @@ $('lockFreqBtn').innerHTML = icons.target;
 const md = $('md');
 const state = {
   sq: 3, wpm: 20, auto: false, running: false,
-  ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true, snrGate: false, snrGateDb: 8,
+  ftype: 'Bandpass', fcenter: 700, fbw: 200, nr: true, follow: true,
   theme: 'light', device: null, detected: 0, freqNow: 0,
 };
 const cfg = {
@@ -53,13 +53,12 @@ const cfg = {
   wpm: { min: 5, max: 50, step: 1 },
   fcenter: { min: 300, max: 1000, step: 10 },
   fbw: { min: 50, max: 600, step: 10 },
-  snrGateDb: { min: 0, max: 20, step: 1 },
 };
 
 function pushFilter() {
   call('SetFilter', {
     type: state.ftype, center: state.fcenter, bandwidth: state.fbw,
-    squelch: state.sq, noiseRed: state.nr, snrGate: state.snrGate, snrGateDb: state.snrGateDb,
+    squelch: state.sq, noiseRed: state.nr, follow: state.follow,
   });
   updateFreqWarn();
 }
@@ -69,7 +68,7 @@ function pushFilter() {
 // enables the lock-to-detected button whenever there's something to lock to.
 function updateFreqWarn() {
   const active = state.running && state.freqNow > 0;
-  const diverged = active && state.ftype !== 'None' && Math.abs(state.freqNow - state.fcenter) > state.fbw / 2;
+  const diverged = active && !state.follow && state.ftype !== 'None' && Math.abs(state.freqNow - state.fcenter) > state.fbw / 2;
   $('freqRo').classList.toggle('warn', diverged);
   $('lockFreqBtn').disabled = !active;
 }
@@ -143,6 +142,7 @@ document.querySelectorAll('.step').forEach((s) => {
   const k = s.dataset.key, c = cfg[k];
   const bump = (d) => {
     if (k === 'wpm' && state.auto) return;
+    if (k === 'fcenter') setFollow(false);
     state[k] = Math.max(c.min, Math.min(c.max, state[k] + d * c.step));
     s.querySelector('.sv').textContent = state[k];
     if (k === 'wpm') { renderWpm(); pushSpeed(); }
@@ -167,7 +167,13 @@ function toggle(id, key) {
   });
 }
 toggle('nr', 'nr');
-toggle('snrgate', 'snrGate');
+toggle('follow', 'follow');
+
+// Tuning by hand means "listen here", so it turns station following off.
+function setFollow(on) {
+  state.follow = on;
+  $('follow').setAttribute('aria-pressed', on ? 'true' : 'false');
+}
 
 // --- Popovers (filters + device picker share this) ---------------------------
 const toolbar = $('toolbar'), pop = $('popFilters'), filtBtn = $('filtBtn');
@@ -368,13 +374,13 @@ function setCenter(hz) {
   pushFilter();
 }
 
-function applySpecCenter(clientX) { setCenter(freqFromPointer(clientX)); }
+function applySpecCenter(clientX) { setFollow(false); setCenter(freqFromPointer(clientX)); }
 
 cv.addEventListener('mousedown', (e) => { specDragging = true; applySpecCenter(e.clientX); });
 document.addEventListener('mousemove', (e) => { if (specDragging) applySpecCenter(e.clientX); });
 document.addEventListener('mouseup', () => { specDragging = false; });
 
-$('lockFreqBtn').addEventListener('click', () => { if (state.freqNow > 0) setCenter(state.freqNow); });
+$('lockFreqBtn').addEventListener('click', () => { if (state.freqNow > 0) { setFollow(false); setCenter(state.freqNow); } });
 
 // --- Events from the backend -------------------------------------------------
 if (haveBackend) {
@@ -397,6 +403,11 @@ if (haveBackend) {
     $('meter').textContent = s.levelDb + ' dB';
     state.detected = s.wpm;
     state.freqNow = s.freq;
+    // While following, the passband marker shows the station being decoded.
+    if (state.follow && s.station > 0 && s.station !== state.fcenter) {
+      state.fcenter = s.station;
+      document.querySelector('.step[data-key="fcenter"] .sv').textContent = state.fcenter;
+    }
     renderWpm();
     updateFreqWarn();
   });

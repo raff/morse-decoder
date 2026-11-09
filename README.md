@@ -78,25 +78,33 @@ have not been tested.
 | Control | Purpose |
 |---------|---------|
 | ▶ / ⏸ | Start / pause decoding |
-| Filters popover | Filter type, centre frequency, bandwidth, squelch (0–9), noise reduction, AGC |
+| Filters popover | Filter type, centre frequency, bandwidth, squelch (0–9), noise reduction, follow station |
 | WPM stepper | Manual speed hint |
 | Auto pill | Enable adaptive speed detection; detected WPM shown in accent colour when running |
 | Clear | Reset decoded text and internal decoder state |
 | Export | Save decoded text to a file |
 | Both / Text / Morse | Toggle output panes |
 
-## Filter types
+## Following stations
 
-| Type | Behaviour |
+With **Follow station** on (the default), the decoder finds whichever station
+is actively keying between 300 and 1100 Hz and retunes when another one takes
+over, as in a back-and-forth QSO. It stays on the current station while that
+station is sending, so only one is copied at a time. In auto mode each station
+keeps its own speed. Tuning by hand (dragging the spectrum, the centre stepper,
+or the lock button) turns following off.
+
+With following off, the decoder only listens within the passband:
+
+| Type | Passband |
 |------|-----------|
-| None | No bandpass; full signal passes through |
-| Bandpass | Single-stage IIR bandpass (default) |
-| Narrow CW | Two-stage bandpass (steeper roll-off, ~64% effective BW) |
-| Auto-notch | Not yet implemented — falls back to Bandpass |
+| None | The whole band, same as following |
+| Bandpass | The set bandwidth (default) |
+| Narrow CW | About 64% of the set bandwidth |
 
-Noise Reduction adds one extra filter stage to whichever type is selected.
-Squelch sets the Schmitt trigger threshold (0 = most sensitive, 9 = strongest
-signal required).
+Noise Reduction narrows either type by about the same factor again. Squelch
+sets the minimum tone-to-noise ratio that counts as key-down (0 = most
+sensitive, 9 = strongest signal required).
 
 ## Prosigns
 
@@ -141,7 +149,7 @@ frontend/src/style.css   Theme (light/dark) and component styles
 | `ListInputDevices()` | Device names for the source picker |
 | `OpenWavFile()` | Native file picker, returns chosen path |
 | `OpenWebSDR(url)` | Start proxy for url, open in browser, switch to websdr source |
-| `SetFilter(FilterConfig)` | Type, centre Hz, bandwidth Hz, squelch, NR, AGC |
+| `SetFilter(FilterConfig)` | Type, centre Hz, bandwidth Hz, squelch, NR, follow |
 | `SetSpeed(SpeedConfig)` | WPM hint + auto-detect flag |
 | `Clear()` / `ExportText(text)` | Reset decoder state / save text |
 
@@ -160,30 +168,15 @@ matching the same constants in `engine.go` and `main.js`.
 
 ## DSP pipeline
 
-### File mode (batch)
-```
-LoadWAV → carrier FFT → bandpass chain → envelope (rectify + lowpass 100 Hz)
-→ 95th-percentile AGC → Schmitt trigger → glitch filter (≥10 ms)
-→ k-means WPM bootstrap → gap calibration → per-pulse classify → ASCII
-```
+Live capture and recordings share one streaming path, so changes in speed,
+level or station partway through are handled the same way in both:
 
-### Live mic mode (streaming, per 2048-sample buffer at 48 kHz ≈ 42 ms)
 ```
-portaudio read → bandpass chain → envelope (rectify + lowpass 100 Hz)
-→ running-peak AGC (τ ≈ 2 s) → Schmitt trigger → pulse merger
-→ noise gate (< max(10 ms, 0.3 × dotMs) dropped) → classify → ASCII
+audio → resample to 4 kHz → 10 Hz-spaced spectrogram, 5 ms frames, window
+matched to the dot length → per-bin noise floor + per-frame wideband static
+correction → station detection and following → adaptive key-up/key-down
+decision → k-means speed lock + re-lock → per-pulse classify → ASCII
 ```
-
-### WebSDR mode (streaming, variable sample rate from browser)
-```
-browser AudioContext tap (ScriptProcessorNode 4096 frames)
-→ mono mix → WebSocket → local proxy → engine AudioCh
-→ [same pipeline as live mic, DSP reinitialised to actual sample rate on first chunk]
-```
-
-Speed is seeded from the manual WPM setting. In Auto mode the EMA adapts
-after bootstrap (≥ 8 tones); the dot estimate is clamped to ≤ 50 WPM to
-prevent noise from sending it haywire.
 
 ## Running the tests
 
@@ -193,6 +186,17 @@ go test ./testdata/ -v
 
 Tests synthesise WAV files at various speeds and SNR levels and verify decode
 accuracy and WPM auto-detection (clean, 20 dB SNR, 10 dB SNR, 10/20/30 WPM).
+
+`engine_quality_test.go` is a slower benchmark that reports character error
+rates for the real engine across noise, fading, static, interference, hand
+keying and station handovers. `MORSE_EVAL_NOISE` scores against the noise in
+your own recordings, adding Morse with a known transcript to a quiet part of
+the band, so no transcript of the recording is needed:
+
+```bash
+MORSE_EVAL=1 go test -v -run 'TestDecodeQuality$' -count=1 -timeout 30m .
+MORSE_EVAL_NOISE=a.wav,b.wav go test -v -run TestDecodeQualityRealNoise -count=1 .
+```
 
 ---
 

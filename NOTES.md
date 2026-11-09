@@ -17,7 +17,8 @@ they consume audio:
   Schmitt trigger, and merges partial pulses across buffer boundaries.
 
 Both paths share `audio/`, `dsp/`, and `morse/` packages that were originally
-written as a standalone CLI (`morse-decoder-engine`).
+written as a standalone CLI (`morse-decoder-engine`), and both now decode
+through `Engine.decodeBuffer` and `dsp.Detector`; see item 13.
 
 ---
 
@@ -338,6 +339,37 @@ Fixed: `#srcBtn` (`frontend/index.html`) is now a non-interactive `<span>`
 (reusing the existing `.lab` style) instead of a `<button>` with no
 handler.
 
+### 13. Decode path replaced by `dsp.Detector`
+
+The bandpass, rectifier, peak AGC, Schmitt trigger and SNR gate were replaced
+by a streaming detector shared by live and file decoding. Measured with
+`engine_quality_test.go`, the old path failed in ways that couldn't be tuned out:
+
+- Noise fills a peak-normalised envelope, so thresholds were crossed constantly.
+- The SNR gate chopped that noise into letter-sized pieces and made garbage
+  worse (0 to 54-116 characters per minute on noise alone).
+- In auto mode the first speed lock trained on noise and never recovered, since
+  only tones classified as dots feed the EMA.
+- A recording's second station on another pitch decoded as pure noise.
+
+Design points worth keeping if this is changed:
+
+- Each bin's noise floor is its 10th percentile. An earlier 25th percentile
+  followed the tone itself at high speed, where smearing leaves few key-up frames.
+- The median of all bins measures wideband static each frame, except when one
+  bin is far above it: strong tones' key clicks lift the median and aren't static.
+- The integration window is 0.85 dot. A full dot was better at low SNR but merged
+  elements; 0.7 cost a lot of sensitivity.
+- Tone-to-noise ratio scales with window length, so the tracked level is
+  adjusted when the window changes.
+- Acquiring a station replays up to 3 s of stored frames, so nothing is lost
+  while it's being recognised. Live output of a new station's first characters
+  is delayed by that recognition time.
+
+Follow mode locks onto whichever station was keying first. With two stations
+sending at once it stays on that one even if the other is the one wanted;
+tuning by hand is the way to choose.
+
 ---
 
 ## Inherits from the batch CLI (morse-decoder-engine)
@@ -355,20 +387,14 @@ would fix this.
 not separated. The bandpass filter passes whichever carrier is loudest within
 the window.
 
-**Filter stage timing distortion** — cascading biquad stages adds group delay
-that slightly shortens measured pulse durations at higher WPM. At 2–3 stages
-and 40+ WPM this can cause a few percent WPM over-estimation. The Narrow CW /
-Noise Reduction settings trade timing accuracy for selectivity.
-
 **Farnsworth detection edge cases** — see the engine README for details. The
 gap calibration guard (c1 > 5 × dot) can misfire when filter stage count
 changes the dot estimate.
 
-**SNR floor** — below ~5 dB SNR, dot-swallowing becomes the dominant failure
-mode (dots fall below the Schmitt trigger threshold and are merged with
-adjacent silences, producing the telltale "NNN TTT" pattern). Pre-processing
-with `sox` or Audacity helps; a per-frame SNR-based confidence score and
-deferred decision would help more.
+**SNR floor** — copy degrades quickly below about -5 dB (in 2.5 kHz) and is
+mostly lost by -10 dB. Key decisions are still made frame by frame, so a soft
+per-frame tone probability with a sequence decoder (or a trained tone detector
+in place of `Detector.decide`) is the likely next gain.
 
 ---
 
