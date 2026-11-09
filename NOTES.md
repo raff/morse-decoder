@@ -57,31 +57,14 @@ UI (`#textOut` is `white-space:pre-wrap`), so not worth guarding against.
 Regression test: `TestLiveWordSpaceEmittedDuringPause` in
 `engine_wordspace_test.go`.
 
-### 3. AGC toggle not implemented
+### 3. AGC toggle — **[obsolete]**
 
-The AGC on/off toggle in the Filters popover is stored in `FilterConfig.AGC`
-and forwarded to `SetFilter`, but `engine.go` ignores it — the running-peak
-tracker (`agcPeak`) always runs.
+The toggle and the running-peak AGC are both gone; see item 13.
 
-What "AGC off" should mean in practice is unclear without a calibrated input
-level. Options:
-- Fix the normalisation denominator to a constant representing the expected
-  peak signal level (requires knowing the gain chain).
-- Disable the decay and only update the peak upward — effectively an
-  "auto-level set once, then hold" mode.
+### 4. Auto-notch filter — **[obsolete]**
 
-For now this toggle does nothing. **[review]** Decide what the expected
-behaviour is and wire it up.
-
-### 4. Auto-notch filter not implemented
-
-Selecting "Auto-notch" in the filter type dropdown falls through to
-single-stage Bandpass behaviour in `filterChain()`. The intent would be to
-detect an interfering carrier nearby and null it with a notch filter while
-keeping the target carrier intact.
-
-This is non-trivial to implement robustly. For now it silently degrades to
-Bandpass. **[review]** Either implement or remove from the dropdown.
+No longer offered in the filter type dropdown, and there's no filter stage for
+it to apply to; see item 13.
 
 ### 5. No live carrier tracking — **[fixed]**
 
@@ -107,18 +90,11 @@ driver was available in this environment to screenshot it; verified via a
 clean `vite build` and by tracing the logic. Worth an eyeball in `wails dev`
 before considering this fully done.
 
-### 6. Bootstrap delay at start of live session
+### 6. Bootstrap delay at start of live session — **[fixed]**
 
-With Auto WPM enabled and WPM hint = 0 (or the estimator not yet
-bootstrapped), `decodePulse` collects the first 8 tones before calling
-`Bootstrap()`. These tones are consumed for speed estimation and never decoded.
-At 20 WPM, 8 tones is roughly the first 2–3 characters.
-
-With a manual WPM set (even the default of 20), the estimator is pre-seeded
-and bootstrap is immediate — no characters are lost.
-
-The practical takeaway: **always set a manual WPM if you know the operator's
-approximate speed**.
+Pulses are now held until the first speed lock and then decoded, so the start
+of a transmission is delayed rather than lost. The lock waits for tones that
+look like real dots and dashes, up to `maxBootstrapTones`.
 
 ### 7. Speed estimator EMA α-boost can be triggered by noise — **[fixed]**
 
@@ -375,6 +351,63 @@ Follow mode locks onto whichever station was keying first. With two stations
 sending at once it stays on that one even if the other is the one wanted;
 tuning by hand is the way to choose.
 
+### 14. Crowded bands: one lock can't separate close stations **[open]**
+
+Follow mode has a single lock that moves between signals. It works when
+stations take turns and are well apart, but two recordings show the limit:
+
+- `websdr_recording_2026-11-09T22_52_31Z_14044.0kHz.wav`: from about 108 s,
+  signals near 580, 660, 730, 850 and 1010 Hz are active at once. The lock
+  slides between them a few bins at a time, so no `NewStation` fires and the
+  next signal is decoded with the previous station's speed. The first 38 s of
+  this recording are also poor, for a reason not yet investigated.
+- `websdr_recording_2026-11-09T21_46_56Z_14055.4kHz.wav`: stations near 570
+  and 630 Hz, close enough that the lock can settle at 600 Hz between them.
+
+Tried and reverted: bounding drift to `sameBins` from where the station was
+acquired. It stopped the sliding but didn't help the first recording, and broke
+the second, where the sliding happened to reach the other station.
+
+Proposed next step: track each active pitch separately, with its own timing
+and speed, and choose which one to display. Further tuning of the single lock
+is likely to trade one recording against another.
+
+### 15. Characters run together on tight spacing **[open]**
+
+Some senders leave gaps between letters of only 80-100 ms against 60-70 ms
+within letters (dot about 55 ms), which produces `?` from a run of two letters,
+e.g. `--..--..` in the 14055.4 kHz recording. Timing alone doesn't resolve it.
+Tried and reverted:
+
+- Learning the intra/char gap boundary per sender: split real letters
+  (`5NN` became `5NTE`) and didn't fix the `?` cases.
+- Splitting unknown codes at their longest gaps: left valid letters alone, but
+  replaced `?` with wrong letters (`?2` became `ETTTI2`) and raised the error
+  rate in static.
+- A longer detector debounce: changed only the noisy start of the recording.
+
+This needs context about likely letters and words, from a sequence decoder or
+a trained model.
+
+### 16. Possible next steps
+
+1. Per-station tracking (item 14).
+2. A real-world benchmark: a hand-copied transcript of part of the 14044.0 kHz
+   conversation would give the project its first real ground truth.
+3. Trained tone detector replacing `Detector.decide`, then a sequence decoder.
+   Copy is still mostly lost at about -10 dB, and fading remains weak.
+
+An unconfirmed report: reception once appeared to stop while the spectrum kept
+running, with the readout near 300 Hz. The likely cause, a station above the
+old 1100 Hz limit, was reproduced and the band widened, but the original event
+was never captured. A recording would confirm it if it recurs.
+
+### Building
+
+`wails build` and `wails dev` fail with `package "math" without types` under Go
+1.27, because Wails v2.12.0 bundles an old `golang.org/x/tools`. Until Wails is
+updated, pin the toolchain: `GOTOOLCHAIN=go1.26.0 wails build`.
+
 ---
 
 ## Inherits from the batch CLI (morse-decoder-engine)
@@ -405,14 +438,9 @@ in place of `Detector.decide`) is the likely next gain.
 
 ## Potential enhancements (future work)
 
-- **Carrier tracking**: phase-locked loop or adaptive notch updated every 0.5 s
-  would keep the bandpass centred on a drifting HF carrier.
 - **Error-correcting decode**: build a Morse trie; when a pulse duration falls
   in the ambiguous zone (1.5–2.5 × dot for tones, 3–5 × dot for gaps), try
   both interpretations and emit the one that produces a valid trie path.
-- **Automatic bandwidth selection**: after carrier detection, find the nearest
-  adjacent peak above the noise floor and set bandwidth to half the distance,
-  clamped to [50, 300] Hz.
 - **OS dark-mode follow**: read
   `window.matchMedia('(prefers-color-scheme: dark)')` on startup to set the
   initial theme rather than always starting in light mode.
