@@ -108,7 +108,22 @@ func (a *App) Stop() { a.engine.Stop() }
 // For "mic", device is the device name returned by ListInputDevices.
 // For "file", device is the path returned by OpenWavFile.
 func (a *App) SetSource(kind string, device string) {
+	if kind != "websdr" {
+		a.closeWebSDR()
+	}
 	a.engine.SetSource(kind, device)
+}
+
+// closeWebSDR stops the WebSDR proxy, which also closes the browser tab
+// showing it (see the tap script's ws.onclose).
+func (a *App) closeWebSDR() {
+	if a.webSDRProxy == nil {
+		return
+	}
+	a.webSDRProxy.Stop()
+	a.engine.Stop()
+	a.engine.SetWebSDRProxy(nil)
+	a.webSDRProxy = nil
 }
 
 // ListInputDevices returns the available audio input device names.
@@ -139,11 +154,7 @@ func (a *App) Clear() { a.engine.Clear() }
 func (a *App) OpenWebSDR(targetURL string) error {
 	// Stop any existing proxy first — closes Done() so captureWebSDR unblocks
 	// before engine.Stop()/wg.Wait() is called.
-	if a.webSDRProxy != nil {
-		a.webSDRProxy.Stop()
-		a.engine.Stop()
-		a.webSDRProxy = nil
-	}
+	a.closeWebSDR()
 
 	proxy, err := websdr.New(targetURL)
 	if err != nil {

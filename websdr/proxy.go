@@ -32,12 +32,15 @@ type Proxy struct {
 	target   *url.URL
 	AudioCh  chan AudioChunk // read by the engine
 	done     chan struct{}   // closed by Stop() to unblock captureWebSDR
-	stopOnce sync.Once      // ensures done is closed exactly once
-	script   string         // tap script precomputed after port is known
+	stopOnce sync.Once       // ensures done is closed exactly once
+	script   string          // tap script precomputed after port is known
 	port     int
 	server   *http.Server
 	rp       *httputil.ReverseProxy
 	up       websocket.Upgrader
+
+	connMu sync.Mutex
+	conns  map[*websocket.Conn]struct{} // open /audio tap sockets, closed by Stop()
 }
 
 // New creates a Proxy for targetURL (e.g. "http://websdr.fi:8080/").
@@ -88,7 +91,7 @@ func (p *Proxy) Start() (string, error) {
 	}
 	p.port = ln.Addr().(*net.TCPAddr).Port
 	p.script = p.tapScript() // port is now fixed; precompute once
-	go p.server.Serve(ln)   //nolint:errcheck
+	go p.server.Serve(ln)    //nolint:errcheck
 
 	local := url.URL{
 		Scheme:   "http",
@@ -106,9 +109,22 @@ func (p *Proxy) Start() (string, error) {
 // Stop shuts down the proxy. It closes the done channel so that
 // captureWebSDR (which blocks on AudioCh) can exit promptly.
 // Safe to call more than once.
+//
+// It also closes every open tap socket (http.Server.Close leaves hijacked
+// connections alone). The injected script treats that close as the cue to
+// shut its browser tab, so the WebSDR page stops playing audio.
 func (p *Proxy) Stop() {
 	p.server.Close()
 	p.stopOnce.Do(func() { close(p.done) })
+	p.connMu.Lock()
+	for c := range p.conns {
+		c.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "decoder closed"),
+			time.Now().Add(time.Second))
+		c.Close()
+	}
+	p.conns = nil
+	p.connMu.Unlock()
 }
 
 // Done returns a channel that is closed when Stop() is called.
@@ -329,6 +345,24 @@ func (p *Proxy) handleAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	p.connMu.Lock()
+	select {
+	case <-p.done: // Stop() already ran; don't leave this tab open
+		p.connMu.Unlock()
+		return
+	default:
+	}
+	if p.conns == nil {
+		p.conns = map[*websocket.Conn]struct{}{}
+	}
+	p.conns[conn] = struct{}{}
+	p.connMu.Unlock()
+	defer func() {
+		p.connMu.Lock()
+		delete(p.conns, conn)
+		p.connMu.Unlock()
+	}()
+
 	for {
 		mt, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -409,6 +443,15 @@ func (p *Proxy) tapScript() string {
   var wsURL = 'ws://localhost:%d/audio';
   var ws = new WebSocket(wsURL);
   ws.binaryType = 'arraybuffer';
+
+  // The decoder closing this socket (app quit, another source or another
+  // WebSDR chosen) means this page is no longer wanted: close the tab, or if
+  // the browser refuses (it only lets script close tabs it opened), blank it
+  // so it stops playing.
+  ws.onclose = function () {
+    try { window.close(); } catch (e) {}
+    setTimeout(function () { location.replace('about:blank'); }, 200);
+  };
 
   var orig = AudioNode.prototype.connect;
   AudioNode.prototype.connect = function (dest, outCh, inCh) {
