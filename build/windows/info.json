@@ -1,0 +1,17 @@
+{
+	"fixed": {
+		"file_version": "0.1.0",
+		"product_version": "0.1.0"
+	},
+	"info": {
+		"0409": {
+			"FileVersion": "0.1.0",
+			"ProductVersion": "0.1.0",
+			"CompanyName": "Morse Decoder",
+			"FileDescription": "Decodes CW (Morse code) audio",
+			"LegalCopyright": "(c) 2026",
+			"ProductName": "Morse Decoder",
+			"Comments": "Morse code decoder"
+		}
+	}
+}

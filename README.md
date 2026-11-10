@@ -7,22 +7,23 @@ bound Go methods, and Go pushes results back as runtime events.
 
 ## Prerequisites
 
-- Go 1.22+ with cgo enabled (on macOS: Xcode Command Line Tools)
+- Go 1.26+ with cgo enabled (on macOS: Xcode Command Line Tools)
 - Node 18+
 - PortAudio:
   - macOS: `brew install portaudio pkg-config`
   - Debian/Ubuntu: `sudo apt install portaudio19-dev`
-- Wails v2 CLI:
+- Wails v3 CLI:
   ```
-  go install github.com/wailsapp/wails/v2/cmd/wails@latest
+  go install github.com/wailsapp/wails/v3/cmd/wails3@latest
   ```
 
 ## Run / Build
 
 ```bash
 go mod tidy
-wails dev          # hot-reloading dev build
-wails build        # distributable app → build/bin/
+wails3 dev         # hot-reloading dev build
+wails3 build       # binary → bin/
+wails3 package     # macOS .app bundle → bin/
 ```
 
 ### macOS microphone permission

@@ -1,16 +1,17 @@
 import './style.css';
+import { Events } from '@wailsio/runtime';
+import { App } from '../bindings/morse-decoder';
 
 // Frequency band the spectrum bins map onto (keep in sync with engine.go).
 const SPEC_FMIN = 200;
 const SPEC_FMAX = 2000;
 
-// --- Backend bridge (Wails injects window.go and window.runtime) -------------
-const App = window.go?.main?.App;
-const RT = window.runtime;
-const haveBackend = !!(App && RT);
+// --- Backend bridge (Wails v3 generated bindings + runtime) ------------------
+// window._wails only exists when running inside the Wails webview.
+const haveBackend = !!window._wails;
 
 function call(method, ...args) {
-  if (App && typeof App[method] === 'function') return App[method](...args);
+  if (haveBackend && typeof App[method] === 'function') return App[method](...args);
   console.warn(`[stub] App.${method}`, args); // running the frontend without Wails
   return Promise.resolve(method === 'ListInputDevices' ? ['Built-in mic'] : undefined);
 }
@@ -418,8 +419,8 @@ $('lockFreqBtn').addEventListener('click', () => { if (state.freqNow > 0) { setF
 
 // --- Events from the backend -------------------------------------------------
 if (haveBackend) {
-  RT.EventsOn('spectrum', (frame) => { latestBins = frame.bins || []; drawSpectrum(); });
-  RT.EventsOn('decoded', (chunk) => {
+  Events.On('spectrum', (ev) => { const frame = ev.data; latestBins = frame.bins || []; drawSpectrum(); });
+  Events.On('decoded', (ev) => { const chunk = ev.data;
     const t = $('textOut'), m = $('morseOut'), textPane = $('textPane'), morsePane = $('morsePane');
     if (chunk.text) {
       const atBottom = textPane.scrollHeight - textPane.scrollTop - textPane.clientHeight < 24;
@@ -432,7 +433,7 @@ if (haveBackend) {
       if (atBottom) morsePane.scrollTop = morsePane.scrollHeight;
     }
   });
-  RT.EventsOn('status', (s) => {
+  Events.On('status', (ev) => { const s = ev.data;
     $('freqRo').textContent = s.freq;
     $('meter').textContent = s.levelDb + ' dB';
     state.detected = s.wpm;
@@ -446,14 +447,14 @@ if (haveBackend) {
     renderWpm();
     updateFreqWarn();
   });
-  RT.EventsOn('done', () => {
+  Events.On('done', (ev) => {
     // File decode finished — reset to idle so the button returns to play.
     state.running = false;
     state.detected = 0;
     renderRecBtn();
     $('statusText').textContent = 'Done';
   });
-  RT.EventsOn('error', (msg) => {
+  Events.On('error', (ev) => { const msg = ev.data;
     // Capture failed / stopped unexpectedly — reset to idle and show why.
     state.running = false;
     state.detected = 0;

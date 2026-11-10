@@ -404,9 +404,10 @@ was never captured. A recording would confirm it if it recurs.
 
 ### Building
 
-`wails build` and `wails dev` fail with `package "math" without types` under Go
-1.27, because Wails v2.12.0 bundles an old `golang.org/x/tools`. Until Wails is
-updated, pin the toolchain: `GOTOOLCHAIN=go1.26.0 wails build`.
+The project was migrated from Wails v2 to v3 (v2.12.0 bundled an old
+`golang.org/x/tools` that fails under Go 1.27 with `package "math" without
+types`). Use `wails3 build` / `wails3 package` / `wails3 dev`; frontend bindings
+are generated into `frontend/bindings` (gitignored) by the build tasks.
 
 ---
 

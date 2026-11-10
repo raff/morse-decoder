@@ -36,9 +36,13 @@ go.work.sum
 
 # frontend node modules
 node_modules/
-wailsjs/
+frontend/bindings/
 dist/
 bin/
 
 package-lock.json
 package.json.md5
+
+# wails3
+.task/
+.wails/

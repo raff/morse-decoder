@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Morse Decoder
+Comment=Decodes CW (Morse code) audio
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/morse-decoder %u
+Terminal=false
+Type=Application
+Icon=morse-decoder
+Categories=Utility;
+StartupWMClass=morse-decoder
+
+ 

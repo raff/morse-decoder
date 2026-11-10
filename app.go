@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
+	"log"
 	"os"
 	"sync/atomic"
 
 	"morse-decoder/websdr"
 
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 // FilterConfig mirrors the "Filters" dialog in the UI.
@@ -26,10 +27,9 @@ type SpeedConfig struct {
 	Auto bool `json:"auto"`
 }
 
-// App is the object bound to the frontend. Every exported method here becomes
-// callable from JS as window.go.main.App.<Method>(...).
+// App is the service bound to the frontend. Every exported method here becomes
+// callable from JS through the generated bindings (frontend/bindings).
 type App struct {
-	ctx          context.Context
 	engine       *Engine
 	webSDRProxy  *websdr.Proxy
 	shuttingDown atomic.Bool
@@ -39,11 +39,11 @@ func NewApp() *App {
 	return &App{}
 }
 
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-	// The engine pushes data to the UI by emitting Wails runtime events.
+// ServiceStartup is called by Wails when the application starts.
+func (a *App) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
+	// The engine pushes data to the UI by emitting Wails events.
 	a.engine = NewEngine(func(event string, data interface{}) {
-		runtime.EventsEmit(a.ctx, event, data)
+		application.Get().Event.Emit(event, data)
 	})
 	a.engine.onPoisoned = func() {
 		if !a.shuttingDown.Load() {
@@ -51,8 +51,9 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	if err := a.engine.Init(); err != nil {
-		runtime.LogError(a.ctx, "portaudio init failed: "+err.Error())
+		log.Println("portaudio init failed:", err)
 	}
+	return nil
 }
 
 // promptRestartAfterPoisoned fires once, the first time the engine latches
@@ -63,30 +64,23 @@ func (a *App) startup(ctx context.Context) {
 // list can't be refreshed — there's no clean way back short of a restart.
 // Other sources (a WAV file, WebSDR, or a different mic device already in
 // the cached list) never call Terminate()/Initialize() and should be
-// unaffected. Runs on its own goroutine since MessageDialog blocks until
-// the user responds.
+// unaffected. The dialog is non-blocking in Wails v3; the buttons call back.
 func (a *App) promptRestartAfterPoisoned() {
-	result, err := runtime.MessageDialog(a.ctx, runtime.MessageDialogOptions{
-		Type:  runtime.WarningDialog,
-		Title: "Microphone capture didn't stop cleanly",
-		Message: "A USB microphone capture didn't stop cleanly after a disconnect, most likely because the driver is still blocked. " +
+	d := application.Get().Dialog.Warning().
+		SetTitle("Microphone capture didn't stop cleanly").
+		SetMessage("A USB microphone capture didn't stop cleanly after a disconnect, most likely because the driver is still blocked. " +
 			"That device can't be reselected and the device list can no longer be refreshed for the rest of this session.\n\n" +
 			"Other sources should be unaffected — a WAV file, WebSDR, or a different microphone device already in the list. " +
-			"Restart the app if you need the affected device back.",
-		Buttons:       []string{"Continue", "Quit"},
-		DefaultButton: "Continue",
-		CancelButton:  "Continue",
-	})
-	if err != nil {
-		runtime.LogError(a.ctx, "message dialog failed: "+err.Error())
-		return
-	}
-	if result == "Quit" {
-		runtime.Quit(a.ctx)
-	}
+			"Restart the app if you need the affected device back.")
+	cont := d.AddButton("Continue")
+	quit := d.AddButton("Quit")
+	quit.OnClick(func() { application.Get().Quit() })
+	d.SetDefaultButton(cont).SetCancelButton(cont)
+	d.Show()
 }
 
-func (a *App) shutdown(ctx context.Context) {
+// ServiceShutdown is called by Wails when the application is closing.
+func (a *App) ServiceShutdown() error {
 	// Once shutdown has started, a leak detected by engine.Close()'s own
 	// Stop() call shouldn't pop a "quit?" dialog — the app is already on
 	// its way out.
@@ -99,6 +93,7 @@ func (a *App) shutdown(ctx context.Context) {
 	if a.engine != nil {
 		a.engine.Close()
 	}
+	return nil
 }
 
 // ---- Methods callable from the frontend ----
@@ -123,12 +118,10 @@ func (a *App) ListInputDevices() []string {
 
 // OpenWavFile shows a native file picker and returns the chosen path ("" if cancelled).
 func (a *App) OpenWavFile() (string, error) {
-	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Open WAV file",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "WAV audio (*.wav)", Pattern: "*.wav"},
-		},
-	})
+	return application.Get().Dialog.OpenFile().
+		SetTitle("Open WAV file").
+		AddFilter("WAV audio (*.wav)", "*.wav").
+		PromptForSingleSelection()
 }
 
 // SetFilter applies new filter / squelch settings (from the Filters dialog).
@@ -165,16 +158,15 @@ func (a *App) OpenWebSDR(targetURL string) error {
 	a.engine.SetWebSDRProxy(proxy)
 	a.engine.SetSource("websdr", "")
 
-	runtime.BrowserOpenURL(a.ctx, localURL)
-	return nil
+	return application.Get().Browser.OpenURL(localURL)
 }
 
 // ExportText shows a save dialog and writes the decoded text to disk.
 func (a *App) ExportText(text string) error {
-	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-		Title:           "Export decoded text",
-		DefaultFilename: "decoded.txt",
-	})
+	path, err := application.Get().Dialog.SaveFile().
+		SetMessage("Export decoded text").
+		SetFilename("decoded.txt").
+		PromptForSingleSelection()
 	if err != nil || path == "" {
 		return err
 	}
